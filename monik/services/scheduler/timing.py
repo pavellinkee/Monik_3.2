@@ -63,6 +63,8 @@ def next_run_at(
         return _next_interval_run(task, now=now, last_run_at=last_run_at)
     if task.mode is TaskMode.DAILY:
         return _next_daily_run(task, now=now, last_run_at=last_run_at)
+    if task.mode is TaskMode.WEEKLY:
+        return _next_weekly_run(task, now=now)
     return None
 
 
@@ -81,6 +83,30 @@ def _next_interval_run(
         return now
     scheduled = last_run_at + interval
     return scheduled if scheduled > now else now
+
+
+def _next_weekly_run(task: SchedulerTask, *, now: datetime) -> datetime:
+    """Следующий запуск еженедельной задачи.
+
+    Момент определяется днём недели и временем, а не числом дней с
+    прошлого запуска: пропуск одной недели не должен сдвигать задачу на
+    другой день (``14_SCHEDULER.md`` §34).
+    """
+    at_time = task.at_time
+    timezone_name = task.timezone_name
+    weekday = task.weekday
+    if at_time is None or timezone_name is None or weekday is None:  # pragma: no cover
+        raise ValueError("WEEKLY task requires at_time, weekday and timezone")
+
+    zone = ZoneInfo(timezone_name)
+    candidate = now.astimezone(zone).date()
+    for _ in range(_MAX_DAYS_AHEAD):
+        if candidate.isoweekday() == weekday:
+            run_at = local_run_instant(candidate, at_time, timezone_name)
+            if run_at > now:
+                return run_at
+        candidate += timedelta(days=1)
+    raise ValueError(f"cannot determine next run for task {task.task_id}")
 
 
 def _next_daily_run(

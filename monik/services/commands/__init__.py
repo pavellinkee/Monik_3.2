@@ -4,7 +4,7 @@
 к провайдерам котировок (``CLAUDE.md`` §35).
 """
 
-from monik.services.commands.handlers import CommandResponse, CommandRouter
+from monik.services.commands.handlers import COMMAND_HELP, CommandResponse, CommandRouter
 from monik.services.commands.parser import (
     CommandName,
     ParsedCommand,
@@ -12,10 +12,16 @@ from monik.services.commands.parser import (
     parse_command,
 )
 from monik.services.commands.ports import (
+    BackupStatus,
+    BackupStatusSource,
     ComponentStatus,
     JobReader,
     NotificationReader,
     OpportunityReader,
+    ProviderStatus,
+    ProviderStatusSource,
+    ScannerControl,
+    ScanReader,
     StatsSnapshot,
     StatsSource,
     StatusSource,
@@ -23,7 +29,10 @@ from monik.services.commands.ports import (
 from monik.services.commands.service import OFFSET_KEY, CommandService, OffsetStore, UpdateSource
 
 __all__ = [
+    "COMMAND_HELP",
     "OFFSET_KEY",
+    "BackupStatus",
+    "BackupStatusSource",
     "CommandName",
     "CommandResponse",
     "CommandRouter",
@@ -34,6 +43,10 @@ __all__ = [
     "OffsetStore",
     "OpportunityReader",
     "ParsedCommand",
+    "ProviderStatus",
+    "ProviderStatusSource",
+    "ScanReader",
+    "ScannerControl",
     "StatsSnapshot",
     "StatsSource",
     "StatusSource",

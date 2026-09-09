@@ -106,6 +106,7 @@ def _build_task(
         ),
         interval_days=schedule.interval_days,
         at_time=at_time,
+        weekday=schedule.weekday,
         timezone_name=schedule.timezone,
     )
 

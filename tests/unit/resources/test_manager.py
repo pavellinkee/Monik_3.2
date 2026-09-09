@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
 
 import pytest
@@ -389,6 +390,37 @@ class TestRetry:
 
 
 class TestCircuitBreakerIntegration:
+    """Порог отказов считается логическими операциями.
+
+    Повторы одной операции — это одна попытка добиться результата, а не
+    несколько независимых отказов ресурса (``12_RESOURCE_MANAGER.md`` §33).
+    Конфигурация тестов: ``failure_threshold = 3``, ``max_attempts = 3``.
+    """
+
+    @staticmethod
+    async def _exhaust(manager: ResourceManager, operation: Callable[[], Awaitable[str]]) -> None:
+        """Исчерпать порог отказов логическими операциями."""
+        for _ in range(3):
+            with pytest.raises(ProviderError):
+                await manager.execute(request(), operation)
+
+    async def test_single_operation_does_not_open_breaker(
+        self, clock: FakeClock, sleeper: ControlledSleeper, rng: random.Random
+    ) -> None:
+        """Три повтора одной операции дают один отказ, а не три (12 §33)."""
+        manager = _manager(clock, sleeper, rng)
+        attempts = 0
+
+        async def failing() -> str:
+            nonlocal attempts
+            attempts += 1
+            raise ProviderError("down")
+
+        with pytest.raises(ProviderError):
+            await manager.execute(request(), failing)
+        assert attempts == 3
+        assert manager.circuit_state(KEY) is CircuitState.CLOSED
+
     async def test_opens_after_repeated_failures(
         self, clock: FakeClock, sleeper: ControlledSleeper, rng: random.Random
     ) -> None:
@@ -397,8 +429,7 @@ class TestCircuitBreakerIntegration:
         async def failing() -> str:
             raise ProviderError("down")
 
-        with pytest.raises(ProviderError):
-            await manager.execute(request(), failing)
+        await self._exhaust(manager, failing)
         assert manager.circuit_state(KEY) is CircuitState.OPEN
 
     async def test_open_circuit_rejects_without_calling(
@@ -412,24 +443,39 @@ class TestCircuitBreakerIntegration:
             called += 1
             raise ProviderError("down")
 
-        with pytest.raises(ProviderError):
-            await manager.execute(request(), failing)
+        await self._exhaust(manager, failing)
         before = called
         with pytest.raises(ResourceError, match="circuit breaker is open"):
             await manager.execute(request(), failing)
         assert called == before
 
+    async def test_data_error_does_not_open_breaker(
+        self, clock: FakeClock, sleeper: ControlledSleeper, rng: random.Random
+    ) -> None:
+        """Некорректные данные — не признак недоступности (05 §29, 19 §55)."""
+        manager = _manager(clock, sleeper, rng)
+
+        async def malformed() -> str:
+            raise DataError("provider response is missing required field 'buyAmount'")
+
+        for _ in range(10):
+            with pytest.raises(DataError):
+                await manager.execute(request(), malformed)
+        assert manager.circuit_state(KEY) is CircuitState.CLOSED
+
     async def test_recovers_after_timeout(
         self, clock: FakeClock, sleeper: ControlledSleeper, rng: random.Random
     ) -> None:
+        """Полный цикл CLOSED → OPEN → HALF_OPEN → CLOSED (05 §68)."""
         manager = _manager(clock, sleeper, rng)
 
         async def failing() -> str:
             raise ProviderError("down")
 
-        with pytest.raises(ProviderError):
-            await manager.execute(request(), failing)
+        await self._exhaust(manager, failing)
+        assert manager.circuit_state(KEY) is CircuitState.OPEN
         clock.advance(timedelta(seconds=11))
+        assert manager.circuit_state(KEY) is CircuitState.HALF_OPEN
         assert await manager.execute(request(), lambda: _ok()) == "ok"
         assert manager.circuit_state(KEY) is CircuitState.CLOSED
 
@@ -442,8 +488,10 @@ class TestCircuitBreakerIntegration:
         async def failing() -> str:
             raise ProviderError("down")
 
-        with pytest.raises(ProviderError):
-            await manager.execute(request(provider=ProviderId.ONEINCH), failing)
+        for _ in range(3):
+            with pytest.raises(ProviderError):
+                await manager.execute(request(provider=ProviderId.ONEINCH), failing)
+        assert manager.circuit_state(KEY) is CircuitState.OPEN
         assert (
             await manager.execute(request(provider=ProviderId.ZERO_X), lambda: _ok("fine"))
             == "fine"

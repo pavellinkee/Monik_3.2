@@ -11,7 +11,7 @@ Provider-specific детали (endpoints, параметры, разбор от
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from monik.config.secrets import SecretValue
@@ -134,6 +134,7 @@ class HttpProviderAdapter:
         timeout: timedelta | None = None,
         deduplication_key: str | None = None,
         batch_units: int = 1,
+        priority_at: datetime | None = None,
     ) -> Any:
         """Выполнить запрос и вернуть разобранный JSON."""
         response = await self.request(
@@ -149,6 +150,7 @@ class HttpProviderAdapter:
             timeout=timeout,
             deduplication_key=deduplication_key,
             batch_units=batch_units,
+            priority_at=priority_at,
         )
         return response.json()
 
@@ -167,6 +169,7 @@ class HttpProviderAdapter:
         timeout: timedelta | None = None,
         deduplication_key: str | None = None,
         batch_units: int = 1,
+        priority_at: datetime | None = None,
     ) -> HttpResponse:
         """Выполнить запрос через Resource Manager.
 
@@ -189,6 +192,7 @@ class HttpProviderAdapter:
             correlation_id=correlation_id,
             deduplication_key=deduplication_key,
             batch_units=batch_units,
+            priority_at=priority_at,
         )
 
         async def call() -> HttpResponse:

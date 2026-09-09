@@ -93,14 +93,14 @@ class TestRetryPolicy:
 
 class TestCircuitBreaker:
     def _breaker(self, clock: FakeClock, **overrides: object) -> CircuitBreaker:
-        config = CircuitBreakerConfig(
-            failure_threshold=3,
-            recovery_timeout_seconds=30.0,
-            half_open_max_calls=1,
-            success_threshold=2,
-            **overrides,  # type: ignore[arg-type]
-        )
-        return CircuitBreaker(config, clock)
+        settings: dict[str, object] = {
+            "failure_threshold": 3,
+            "recovery_timeout_seconds": 30.0,
+            "half_open_max_calls": 1,
+            "success_threshold": 2,
+        }
+        settings.update(overrides)
+        return CircuitBreaker(CircuitBreakerConfig(**settings), clock)  # type: ignore[arg-type]
 
     def test_starts_closed(self, clock: FakeClock) -> None:
         breaker = self._breaker(clock)
@@ -153,14 +153,76 @@ class TestCircuitBreaker:
         assert breaker.state is CircuitState.OPEN
 
     def test_half_open_closes_after_successes(self, clock: FakeClock) -> None:
+        """Полный цикл восстановления в том порядке, в котором его
+        выполняет Resource Manager: перед каждой пробой вызывается
+        ``on_request_started`` (``05_RESOURCE_MANAGER.md`` §68).
+
+        Без освобождения слота после удачной пробы breaker при
+        ``half_open_max_calls = 1`` и ``success_threshold = 2`` навсегда
+        оставался бы в ``HALF_OPEN``.
+        """
+        breaker = self._breaker(clock)
+        for _ in range(3):
+            breaker.on_failure()
+        assert breaker.state is CircuitState.OPEN
+
+        clock.advance(timedelta(seconds=31))
+        assert breaker.state is CircuitState.HALF_OPEN
+
+        assert breaker.allows_request()
+        breaker.on_request_started()
+        breaker.on_success()
+        assert breaker.state is CircuitState.HALF_OPEN
+
+        assert breaker.allows_request(), "второй пробе нужен свободный слот"
+        breaker.on_request_started()
+        breaker.on_success()
+        assert breaker.state is CircuitState.CLOSED
+        assert breaker.allows_request()
+
+    @pytest.mark.parametrize("half_open_max_calls", [1, 2, 3])
+    @pytest.mark.parametrize("success_threshold", [1, 2, 3])
+    def test_recovery_is_reachable_for_any_configuration(
+        self, clock: FakeClock, half_open_max_calls: int, success_threshold: int
+    ) -> None:
+        """Ни одно сочетание порогов не делает восстановление невозможным.
+
+        Регрессия: при ``half_open_max_calls < success_threshold`` breaker
+        запирался в ``HALF_OPEN`` и ресурс не восстанавливался никогда.
+        """
+        breaker = self._breaker(
+            clock,
+            half_open_max_calls=half_open_max_calls,
+            success_threshold=success_threshold,
+        )
+        for _ in range(3):
+            breaker.on_failure()
+        clock.advance(timedelta(seconds=31))
+
+        for _ in range(success_threshold):
+            assert breaker.allows_request()
+            breaker.on_request_started()
+            breaker.on_success()
+        assert breaker.state is CircuitState.CLOSED
+
+    def test_half_open_probe_failure_reopens_and_recovery_stays_possible(
+        self, clock: FakeClock
+    ) -> None:
+        """Неудачная проба возвращает OPEN, но не запирает ресурс."""
         breaker = self._breaker(clock)
         for _ in range(3):
             breaker.on_failure()
         clock.advance(timedelta(seconds=31))
-        breaker.on_success()
-        breaker.on_success()
+        breaker.on_request_started()
+        breaker.on_failure()
+        assert breaker.state is CircuitState.OPEN
+
+        clock.advance(timedelta(seconds=31))
+        for _ in range(2):
+            assert breaker.allows_request()
+            breaker.on_request_started()
+            breaker.on_success()
         assert breaker.state is CircuitState.CLOSED
-        assert breaker.allows_request()
 
     def test_disabled_breaker_always_allows(self, clock: FakeClock) -> None:
         breaker = self._breaker(clock, enabled=False)

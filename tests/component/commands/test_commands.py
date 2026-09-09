@@ -36,6 +36,11 @@ from monik.services.commands import (
     parse_callback,
     parse_command,
 )
+from monik.services.commands.parser import (
+    action_callback_data,
+    confirm_callback_data,
+    provider_callback_data,
+)
 from monik.services.observability import FakeClock
 from monik.services.opportunity import ConfirmationStatistics
 from tests import factories as f
@@ -158,9 +163,33 @@ def test_plain_text_is_not_a_command() -> None:
 
 
 def test_callback_data_is_parsed() -> None:
-    assert parse_callback("details:abc-123") == "abc-123"
-    assert parse_callback("other:abc") is None
-    assert parse_callback("details:") is None
+    """Кнопка ``об`` ссылается на сохранённое уведомление."""
+    assert parse_callback("details:abc-123").notification_id == "abc-123"
+    assert not parse_callback("other:abc").is_known
+    assert not parse_callback("details:").is_known
+
+
+def test_action_callback_repeats_a_command() -> None:
+    """Кнопка выполняет ту же команду, что и текст."""
+    parsed = parse_callback(action_callback_data(CommandName.STATUS))
+    assert parsed.command is not None
+    assert parsed.command.name is CommandName.STATUS
+    assert not parsed.confirmed
+
+
+def test_confirmation_callback_is_marked_confirmed() -> None:
+    """Подтверждённое действие отличается от обычного нажатия."""
+    parsed = parse_callback(confirm_callback_data(CommandName.RESTART))
+    assert parsed.command is not None
+    assert parsed.command.name is CommandName.RESTART
+    assert parsed.confirmed
+
+
+def test_provider_callback_selects_one_aggregator() -> None:
+    parsed = parse_callback(provider_callback_data("uniswap"))
+    assert parsed.command is not None
+    assert parsed.command.name is CommandName.PROVIDERS
+    assert parsed.command.argument == "uniswap"
 
 
 # --- обработчики ----------------------------------------------------------

@@ -15,6 +15,7 @@ import asyncio
 import builtins
 import heapq
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from monik.domain.errors import ResourceError, TimeoutError
 from monik.domain.models.resource import ResourceRequest
@@ -26,7 +27,7 @@ __all__ = ["PriorityGate"]
 class _Waiter:
     """Ожидающий запрос в очереди."""
 
-    ordering_key: tuple[int, object, int]
+    ordering_key: tuple[int, datetime, datetime, int]
     tiebreaker: int
     future: asyncio.Future[None] = field(compare=False)
 
@@ -74,11 +75,10 @@ class PriorityGate:
         future: asyncio.Future[None] = loop.create_future()
         self._sequence += 1
         waiter = _Waiter(
-            ordering_key=(
-                request.priority.rank,
-                request.created_at,
-                request.sequence,
-            ),
+            # Единый ключ упорядочивания задаёт сам запрос: приоритет,
+            # время начала породившей работы, время создания и sequence
+            # (``05_RESOURCE_MANAGER.md`` §17).
+            ordering_key=request.ordering_key,
             tiebreaker=self._sequence,
             future=future,
         )

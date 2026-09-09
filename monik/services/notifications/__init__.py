@@ -13,6 +13,7 @@ from monik.services.notifications.formatter import DETAILS_BUTTON_LABEL, Message
 from monik.services.notifications.policy import SendDecision, mode_decision
 from monik.services.notifications.ports import (
     DeliveryReceipt,
+    MessageButton,
     NotificationStore,
     NotificationTransport,
     OutgoingMessage,
@@ -27,6 +28,7 @@ __all__ = [
     "DETAILS_BUTTON_LABEL",
     "DeliveryReceipt",
     "DeliveryReport",
+    "MessageButton",
     "MessageFormatter",
     "NotificationDispatcher",
     "NotificationStore",

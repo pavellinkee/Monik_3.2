@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 from monik.config import load_configuration
 from monik.domain.errors import MonikError
 from monik.infrastructure.db import Database
+from monik.infrastructure.db.backup import backup_name
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -33,11 +34,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="backup directory (defaults to database.backup_directory)",
     )
     return parser
-
-
-def backup_name(now: datetime) -> str:
-    """Имя файла резервной копии."""
-    return f"monik-{now.strftime('%Y%m%dT%H%M%SZ')}.db"
 
 
 async def verify(path: pathlib.Path) -> None:

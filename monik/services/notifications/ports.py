@@ -15,7 +15,31 @@ from monik.domain.models.notification import (
 from monik.domain.value_objects.identifiers import OpportunityId
 from monik.domain.value_objects.timestamps import UtcDatetime
 
-__all__ = ["DeliveryReceipt", "NotificationStore", "NotificationTransport", "OutgoingMessage"]
+__all__ = [
+    "DeliveryReceipt",
+    "MessageButton",
+    "NotificationStore",
+    "NotificationTransport",
+    "OutgoingMessage",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class MessageButton:
+    """Кнопка под сообщением.
+
+    Несёт только подпись и данные обратного вызова: транспорт не решает,
+    что кнопка делает (``15_NOTIFICATION_SYSTEM.md`` §10).
+    """
+
+    label: str
+    callback_data: str
+
+    def __post_init__(self) -> None:
+        if not self.label.strip():
+            raise ValueError("button label must not be empty")
+        if not self.callback_data.strip():
+            raise ValueError("button callback data must not be empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,12 +48,18 @@ class OutgoingMessage:
 
     Тексты сформированы заранее: транспорт ничего не пересчитывает и не
     форматирует (``15_NOTIFICATION_SYSTEM.md`` §14).
+
+    ``buttons`` — ряды кнопок управления. ``details_callback`` остаётся
+    отдельным полем: кнопка ``об`` обязана присутствовать в каждом
+    уведомлении о возможности (``CLAUDE.md`` §35) и не смешивается с
+    кнопками меню.
     """
 
     destination: NotificationDestination
     text: str
     details_callback: str | None = None
     details_label: str | None = None
+    buttons: tuple[tuple[MessageButton, ...], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

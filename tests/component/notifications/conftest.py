@@ -27,6 +27,7 @@ from monik.repositories.sqlite import (
 )
 from monik.services.notifications import MessageFormatter, NotificationDispatcher
 from monik.services.observability import FakeClock
+from monik.services.observability.metrics import MetricsRegistry
 from monik.services.opportunity import OpportunityService, build_snapshot
 from monik.services.registries import TokenRegistry
 from tests import factories as f
@@ -113,10 +114,11 @@ async def build_notifications(
     transport: FakeTransport | None = None,
     destinations: tuple[NotificationDestination, ...] = (TELEGRAM,),
     queue: bool = True,
+    metrics: MetricsRegistry | None = None,
 ) -> NotificationHarness:
     """Подтвердить возможность и собрать над ней Notification System."""
     config = configuration or configured()
-    level2 = await build_level2(config, database, clock)
+    level2 = await build_level2(config, database, clock, metrics=metrics)
     result = await level2.scanner.confirm(level2.job)
     tokens = TokenRegistry(config)
     formatter = MessageFormatter(config.notifications, tokens)
@@ -137,6 +139,7 @@ async def build_notifications(
         store=SqliteNotificationRepository(database),
         transports={DestinationKind.TELEGRAM.value: delivery_transport},
         clock=clock,
+        metrics=metrics,
     )
     return NotificationHarness(
         configuration=config,

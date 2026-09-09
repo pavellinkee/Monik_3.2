@@ -114,6 +114,7 @@ class ZeroXAdapter(HttpProviderAdapter):
             priority=request.priority,
             correlation_id=request.correlation_id,
             timeout=request.timeout,
+            priority_at=request.priority_at,
         )
         return self._to_quote(request, payload)
 

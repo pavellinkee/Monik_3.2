@@ -1,55 +1,129 @@
 """Обработчики команд Telegram.
 
-Ответ формируется **только** из сохранённых данных (``CLAUDE.md`` §35):
-обработчик не обращается к провайдерам котировок, не выполняет расчётов и
-не запускает сканирование.
+Ответ формируется **только** из сохранённых данных и уже собранных
+снимков (``CLAUDE.md`` §35): обработчик не обращается к провайдерам
+котировок и не выполняет расчётов.
 
-Некорректный ввод превращается в понятный ответ, а не в ошибку подсистемы.
+Управление сканером — единственное исключение из «только чтение»: оно
+выполняется через узкий порт :class:`ScannerControl`, который лишь
+сообщает намерение оператора. Планировщика и сканеров подсистема команд
+по-прежнему не знает.
+
+Действия, прерывающие работу сканера, требуют явного подтверждения:
+случайное нажатие не должно останавливать production.
+
+Секреты в ответы не попадают: показывается только операционное состояние
+(``19_HEALTH_MONITORING.md`` §65).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from monik.domain.enums.control import ScannerRunState
 from monik.domain.enums.lifecycle import JobStatus
 from monik.domain.errors import DomainValidationError
 from monik.domain.models.job import ConfirmationResult, Level2Job
 from monik.domain.value_objects.identifiers import KId
 from monik.services.commands.parser import (
+    DESTRUCTIVE_COMMANDS,
     CommandName,
     ParsedCommand,
+    action_callback_data,
+    confirm_callback_data,
     parse_callback,
     parse_command,
+    provider_callback_data,
 )
 from monik.services.commands.ports import (
+    BackupStatusSource,
     JobReader,
     NotificationReader,
+    ProviderStatus,
+    ProviderStatusSource,
+    ScannerControl,
+    ScanReader,
     StatsSource,
     StatusSource,
 )
+from monik.services.notifications.ports import MessageButton
 from monik.services.observability.logging import get_logger, log_fields
 
-__all__ = ["CommandResponse", "CommandRouter"]
+__all__ = ["COMMAND_HELP", "CommandResponse", "CommandRouter"]
 
 _LOGGER = get_logger("services.commands")
 
 #: Сколько активных Job показывать в ``/level2``.
 _ACTIVE_JOB_LIMIT = 20
 
+#: Сколько последних циклов показывать в ``/scans``.
+_RECENT_SCAN_LIMIT = 5
+
 #: Статусы, считающиеся активными для ``/level2``.
 _ACTIVE_STATUSES = (JobStatus.QUEUED, JobStatus.RUNNING)
+
+#: Назначение каждой команды. Используется в ``/help`` и в
+#: ``docs/telegram_commands.md``: описание живёт в одном месте.
+COMMAND_HELP: tuple[tuple[CommandName, str], ...] = (
+    (CommandName.MENU, "показать кнопки управления"),
+    (CommandName.HELP, "список команд"),
+    (CommandName.STATUS, "состояние приложения целиком"),
+    (CommandName.PROVIDERS, "состояние агрегаторов и их очередей"),
+    (CommandName.SCANS, "последние циклы Level 1"),
+    (CommandName.LEVEL2, "активные проверки Level 2"),
+    (CommandName.DETAILS, "результат проверки по идентификатору, например /details K1234"),
+    (CommandName.STATS, "накопленная статистика с момента запуска"),
+    (CommandName.BACKUP, "состояние резервного копирования"),
+    (CommandName.START_SCANNER, "разрешить сканирование"),
+    (CommandName.STOP_SCANNER, "остановить сканирование (с подтверждением)"),
+    (CommandName.RESTART, "перезапустить приложение (с подтверждением)"),
+)
+
+#: Подписи кнопок меню.
+_BUTTON_LABELS: dict[CommandName, str] = {
+    CommandName.START_SCANNER: "▶️ Запустить",
+    CommandName.STOP_SCANNER: "⏸ Остановить",
+    CommandName.RESTART: "🔄 Перезапустить",
+    CommandName.STATUS: "📊 Статус",
+    CommandName.PROVIDERS: "🔌 Статус агрегатора",
+    CommandName.STATS: "📈 Статистика",
+    CommandName.LEVEL2: "🧪 Level 2",
+    CommandName.SCANS: "🕔 Последние сканы",
+    CommandName.BACKUP: "💾 Резервные копии",
+    CommandName.HELP: "❓ Помощь",
+}
+
+#: Человекочитаемое состояние сканера.
+_RUN_STATE_LABELS: dict[ScannerRunState, str] = {
+    ScannerRunState.RUNNING: "сканирование идёт",
+    ScannerRunState.PAUSED: "сканирование остановлено оператором",
+    ScannerRunState.RESTARTING: "запрошен перезапуск",
+}
+
+#: Что именно подтверждает пользователь.
+_CONFIRMATION_PROMPTS: dict[CommandName, str] = {
+    CommandName.STOP_SCANNER: (
+        "Остановить сканирование?\n"
+        "Новые циклы Level 1 запускаться не будут. "
+        "Уже принятые проверки Level 2 завершатся."
+    ),
+    CommandName.RESTART: (
+        "Перезапустить приложение?\nТекущий цикл будет корректно завершён, процесс перезапустится."
+    ),
+}
 
 
 @dataclass(frozen=True, slots=True)
 class CommandResponse:
-    """Текст ответа и признак успешной обработки."""
+    """Текст ответа, кнопки и признак успешной обработки."""
 
     text: str
     handled: bool = True
+    buttons: tuple[tuple[MessageButton, ...], ...] = field(default=())
 
 
 class CommandRouter:
-    """Маршрутизирует команды и нажатия кнопки ``об``."""
+    """Маршрутизирует команды и нажатия кнопок."""
 
     def __init__(
         self,
@@ -58,32 +132,51 @@ class CommandRouter:
         notifications: NotificationReader,
         status: StatusSource,
         stats: StatsSource,
+        providers: ProviderStatusSource | None = None,
+        scans: ScanReader | None = None,
+        control: ScannerControl | None = None,
+        backups: BackupStatusSource | None = None,
+        application: str | None = None,
+        environment: str | None = None,
     ) -> None:
         self._jobs = jobs
         self._notifications = notifications
         self._status = status
         self._stats = stats
+        self._providers = providers
+        self._scans = scans
+        self._control = control
+        self._backups = backups
+        self._application = application
+        self._environment = environment
 
     async def handle_text(self, text: str) -> CommandResponse:
         """Обработать текстовую команду."""
         command = parse_command(text)
         if command.error is not None:
             return CommandResponse(text=command.error, handled=False)
+        if command.name in DESTRUCTIVE_COMMANDS:
+            # Текстовая команда опасного действия сама его не выполняет.
+            return self._confirmation_request(command.name)
         return await self._dispatch(command)
 
     async def handle_callback(self, data: str) -> CommandResponse:
-        """Обработать нажатие кнопки ``об``.
+        """Обработать нажатие кнопки.
 
-        Текст берётся из сохранённого уведомления: новых внешних запросов
-        не выполняется (``CLAUDE.md`` §35).
+        Текст ``об`` берётся из сохранённого уведомления: новых внешних
+        запросов не выполняется (``CLAUDE.md`` §35).
         """
-        notification_id = parse_callback(data)
-        if notification_id is None:
+        callback = parse_callback(data)
+        if callback.notification_id is not None:
+            _, details = await self._notifications.load_texts(callback.notification_id)
+            if details is None:
+                return CommandResponse(text="детали недоступны", handled=False)
+            return CommandResponse(text=details)
+        if callback.command is None:
             return CommandResponse(text="неизвестное действие", handled=False)
-        _, details = await self._notifications.load_texts(notification_id)
-        if details is None:
-            return CommandResponse(text="детали недоступны", handled=False)
-        return CommandResponse(text=details)
+        if callback.command.name in DESTRUCTIVE_COMMANDS and not callback.confirmed:
+            return self._confirmation_request(callback.command.name)
+        return await self._dispatch(callback.command)
 
     # --- обработчики ------------------------------------------------------
 
@@ -96,7 +189,101 @@ class CommandRouter:
             return self._status_response()
         if command.name is CommandName.STATS:
             return self._stats_response()
+        if command.name is CommandName.MENU:
+            return self._menu_response()
+        if command.name is CommandName.HELP:
+            return self._help_response()
+        if command.name is CommandName.PROVIDERS:
+            return self._providers_response(command.argument)
+        if command.name is CommandName.SCANS:
+            return await self._scans_response()
+        if command.name is CommandName.BACKUP:
+            return await self._backup_response()
+        if command.name in {
+            CommandName.START_SCANNER,
+            CommandName.STOP_SCANNER,
+            CommandName.RESTART,
+        }:
+            return self._control_response(command.name)
         return CommandResponse(text="неизвестная команда", handled=False)
+
+    # --- управление -------------------------------------------------------
+
+    def _confirmation_request(self, command: CommandName) -> CommandResponse:
+        """Спросить подтверждение перед прерыванием работы."""
+        return CommandResponse(
+            text=_CONFIRMATION_PROMPTS[command],
+            buttons=(
+                (
+                    MessageButton(label="✅ Да", callback_data=confirm_callback_data(command)),
+                    MessageButton(
+                        label="↩️ Отмена", callback_data=action_callback_data(CommandName.MENU)
+                    ),
+                ),
+            ),
+        )
+
+    def _control_response(self, command: CommandName) -> CommandResponse:
+        """Выполнить подтверждённое управляющее действие."""
+        if self._control is None:
+            return CommandResponse(text="управление сканером недоступно", handled=False)
+        if command is CommandName.START_SCANNER:
+            changed = self._control.start()
+            text = "▶️ Сканирование запущено" if changed else "Сканирование уже идёт"
+        elif command is CommandName.STOP_SCANNER:
+            changed = self._control.stop()
+            text = (
+                "⏸ Сканирование остановлено. Принятые проверки Level 2 завершатся."
+                if changed
+                else "Сканирование уже остановлено"
+            )
+        else:
+            self._control.request_restart()
+            text = "🔄 Перезапуск запрошен. Приложение поднимется автоматически."
+        _LOGGER.warning(
+            "scanner control command executed",
+            extra=log_fields(operation=command.value, state=self._control.state().value),
+        )
+        return CommandResponse(text=text, buttons=self._menu_buttons())
+
+    # --- информация -------------------------------------------------------
+
+    def _menu_response(self) -> CommandResponse:
+        state = self._control.state() if self._control is not None else None
+        header = "Управление Monik"
+        if state is not None:
+            header = f"{header}\n{_RUN_STATE_LABELS[state]}"
+        return CommandResponse(text=header, buttons=self._menu_buttons())
+
+    def _menu_buttons(self) -> tuple[tuple[MessageButton, ...], ...]:
+        """Кнопки меню. Управляющие показываются только при наличии порта."""
+        rows: list[tuple[MessageButton, ...]] = []
+        if self._control is not None:
+            rows.append(
+                tuple(
+                    _button(command)
+                    for command in (
+                        CommandName.START_SCANNER,
+                        CommandName.STOP_SCANNER,
+                        CommandName.RESTART,
+                    )
+                )
+            )
+        rows.append((_button(CommandName.STATUS), _button(CommandName.PROVIDERS)))
+        rows.append((_button(CommandName.STATS), _button(CommandName.LEVEL2)))
+        tail = [_button(CommandName.SCANS)]
+        if self._backups is not None:
+            tail.append(_button(CommandName.BACKUP))
+        tail.append(_button(CommandName.HELP))
+        rows.append(tuple(tail))
+        return tuple(rows)
+
+    def _help_response(self) -> CommandResponse:
+        lines = ["Команды Monik:"]
+        lines.extend(f"/{command.value} — {purpose}" for command, purpose in COMMAND_HELP)
+        lines.append("")
+        lines.append("Остановка и перезапуск запрашивают подтверждение.")
+        return CommandResponse(text="\n".join(lines), buttons=self._menu_buttons())
 
     async def _details(self, raw_k_id: str) -> CommandResponse:
         """``/details K1234`` — сохранённый результат проверки."""
@@ -130,15 +317,101 @@ class CommandRouter:
         return CommandResponse(text="\n".join(lines))
 
     def _status_response(self) -> CommandResponse:
-        """``/status`` — состояние подсистем."""
+        """``/status`` — состояние приложения."""
         components = self._status.components()
         if not components:
             return CommandResponse(text="состояние подсистем недоступно", handled=False)
-        lines = ["Состояние подсистем:"]
+        lines = ["Состояние Monik"]
+        if self._application:
+            lines.append(f"Версия: {self._application}")
+        if self._environment:
+            lines.append(f"Окружение: {self._environment}")
+        if self._control is not None:
+            lines.append(f"Сканер: {_RUN_STATE_LABELS[self._control.state()]}")
+        lines.append("")
+        lines.append("Подсистемы:")
         lines.extend(
             f"{item.name}: {item.state}" + (f" ({item.detail})" if item.detail else "")
             for item in components
         )
+        if self._providers is not None:
+            queues = self._providers.providers()
+            if queues:
+                lines.append("")
+                lines.append("Очереди агрегаторов:")
+                lines.extend(_provider_line(item) for item in queues)
+        return CommandResponse(text="\n".join(lines), buttons=self._menu_buttons())
+
+    def _providers_response(self, requested: str | None) -> CommandResponse:
+        """``/providers`` — состояние агрегаторов, при аргументе — одного."""
+        if self._providers is None:
+            return CommandResponse(text="состояние агрегаторов недоступно", handled=False)
+        statuses = self._providers.providers()
+        if not statuses:
+            return CommandResponse(text="агрегаторы не настроены", handled=False)
+        if requested is not None:
+            wanted = requested.strip().lower()
+            selected = [item for item in statuses if item.provider == wanted]
+            if not selected:
+                names = ", ".join(item.provider for item in statuses)
+                return CommandResponse(
+                    text=f"неизвестный агрегатор: {requested}. Доступны: {names}",
+                    handled=False,
+                )
+            return CommandResponse(text=_provider_details(selected[0]))
+        lines = ["Состояние агрегаторов:"]
+        lines.extend(_provider_line(item) for item in statuses)
+        return CommandResponse(
+            text="\n".join(lines),
+            buttons=(
+                tuple(
+                    MessageButton(
+                        label=item.provider, callback_data=provider_callback_data(item.provider)
+                    )
+                    for item in statuses
+                ),
+            ),
+        )
+
+    async def _scans_response(self) -> CommandResponse:
+        """``/scans`` — последние циклы Level 1."""
+        if self._scans is None:
+            return CommandResponse(text="история циклов недоступна", handled=False)
+        scans = await self._scans.recent(limit=_RECENT_SCAN_LIMIT)
+        if not scans:
+            return CommandResponse(text="циклов пока не было")
+        lines = ["Последние циклы Level 1:"]
+        for scan in scans:
+            finished = (
+                scan.finished_at.isoformat(timespec="seconds")
+                if scan.finished_at
+                else "выполняется"
+            )
+            statistics = scan.statistics
+            lines.append(
+                f"{finished} · {scan.status.value} · "
+                f"запросов {statistics.quote_requests} · "
+                f"успешно {statistics.successful_quotes} · "
+                f"возможностей {statistics.opportunities_created}"
+            )
+        return CommandResponse(text="\n".join(lines))
+
+    async def _backup_response(self) -> CommandResponse:
+        """``/backup`` — состояние резервного копирования."""
+        if self._backups is None:
+            return CommandResponse(text="резервное копирование не настроено", handled=False)
+        status = await self._backups.status()
+        if not status.enabled:
+            return CommandResponse(text="резервное копирование выключено")
+        lines = ["Резервное копирование:", f"Копий сохранено: {status.copies}"]
+        if status.last_run_at:
+            lines.append(f"Последняя копия: {status.last_run_at}")
+        else:
+            lines.append("Последняя копия: ещё не создавалась")
+        if status.last_outcome:
+            lines.append(f"Результат: {status.last_outcome}")
+        if status.detail:
+            lines.append(status.detail)
         return CommandResponse(text="\n".join(lines))
 
     def _stats_response(self) -> CommandResponse:
@@ -147,7 +420,7 @@ class CommandRouter:
         rate = snapshot.confirmations.confirmation_rate
         _LOGGER.info("stats requested", extra=log_fields(decided=snapshot.confirmations.decided))
         lines = [
-            "Статистика:",
+            "Статистика с момента запуска:",
             f"Циклов Level 1: {snapshot.scans_completed}",
             f"Возможностей создано: {snapshot.opportunities_created}",
             f"Уведомлений отправлено: {snapshot.notifications_sent}",
@@ -159,6 +432,35 @@ class CommandRouter:
             f"Confirmation rate: {'N/A' if rate is None else f'{rate:.2f}%'}",
         ]
         return CommandResponse(text="\n".join(lines))
+
+
+def _button(command: CommandName) -> MessageButton:
+    return MessageButton(label=_BUTTON_LABELS[command], callback_data=action_callback_data(command))
+
+
+def _provider_line(item: ProviderStatus) -> str:
+    """Одна строка состояния агрегатора."""
+    return (
+        f"{item.provider}: {item.health}"
+        f" · очередь {item.active}/{item.max_concurrent}"
+        f" (ожидают {item.waiting})"
+        f" · {item.requests_per_second} зап/с"
+    )
+
+
+def _provider_details(item: ProviderStatus) -> str:
+    """Подробное состояние одного агрегатора."""
+    lines = [
+        f"Агрегатор {item.provider}",
+        f"Состояние: {item.health}",
+        f"Circuit breaker: {item.circuit_state}",
+        f"Лимит частоты: {item.requests_per_second} запросов в секунду",
+        f"Одновременных запросов: {item.active} из {item.max_concurrent}",
+        f"Ожидают в очереди: {item.waiting}",
+    ]
+    if item.reason:
+        lines.append(f"Причина: {item.reason}")
+    return "\n".join(lines)
 
 
 def _details_text(result: ConfirmationResult, job_status: JobStatus) -> str:

@@ -13,7 +13,7 @@ Provider-specific интерпретацию маршрута выполняет
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from monik.domain.enums.capability import CapabilityOperation, CapabilityStatus
 from monik.domain.enums.operations import RouteValidationOutcome
@@ -75,6 +75,7 @@ class RouteVerifier:
         input_token: Token,
         output_token: Token,
         input_amount: TokenAmount,
+        priority_at: datetime | None = None,
     ) -> RouteCheck:
         """Проверить ногу маршрута и вернуть свежую котировку.
 
@@ -102,6 +103,9 @@ class RouteVerifier:
             fixed_route=route,
             priority=RequestPriority.LEVEL2,
             timeout=self._request_timeout,
+            # Проверка, начатая раньше, обслуживается раньше начатой
+            # позже (``05_RESOURCE_MANAGER.md`` §17-18).
+            priority_at=priority_at,
         )
         try:
             validation = await adapter.validate_fixed_route(request)

@@ -10,17 +10,25 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
+from monik.domain.enums.control import ScannerRunState
 from monik.domain.enums.lifecycle import JobStatus
 from monik.domain.models.job import ConfirmationResult, Level2Job
 from monik.domain.models.opportunity import Opportunity
+from monik.domain.models.scan import Scan
 from monik.domain.value_objects.identifiers import KId, OpportunityId
 from monik.services.opportunity.statistics import ConfirmationStatistics
 
 __all__ = [
+    "BackupStatus",
+    "BackupStatusSource",
     "ComponentStatus",
     "JobReader",
     "NotificationReader",
     "OpportunityReader",
+    "ProviderStatus",
+    "ProviderStatusSource",
+    "ScanReader",
+    "ScannerControl",
     "StatsSnapshot",
     "StatsSource",
     "StatusSource",
@@ -100,4 +108,87 @@ class StatsSource(Protocol):
 
     def snapshot(self) -> StatsSnapshot:
         """Текущая статистика."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderStatus:
+    """Состояние одного агрегатора и его очереди.
+
+    Собирается из Health Monitoring и Resource Manager. Ни ключей, ни
+    заголовков аутентификации здесь нет: наружу выходит только
+    операционное состояние (``19_HEALTH_MONITORING.md`` §65).
+    """
+
+    provider: str
+    health: str
+    circuit_state: str
+    requests_per_second: float
+    max_concurrent: int
+    active: int
+    waiting: int
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BackupStatus:
+    """Состояние резервного копирования для отчёта пользователю."""
+
+    enabled: bool
+    last_run_at: str | None = None
+    last_outcome: str | None = None
+    copies: int = 0
+    detail: str | None = None
+
+
+@runtime_checkable
+class ProviderStatusSource(Protocol):
+    """Снимок состояния агрегаторов."""
+
+    def providers(self) -> tuple[ProviderStatus, ...]:
+        """Состояние всех настроенных агрегаторов."""
+        ...
+
+
+@runtime_checkable
+class ScanReader(Protocol):
+    """Чтение последних циклов Level 1."""
+
+    async def recent(self, *, limit: int) -> tuple[Scan, ...]:
+        """Последние циклы, сначала свежие."""
+        ...
+
+
+@runtime_checkable
+class BackupStatusSource(Protocol):
+    """Состояние механизма резервного копирования."""
+
+    async def status(self) -> BackupStatus:
+        """Текущее состояние резервных копий."""
+        ...
+
+
+@runtime_checkable
+class ScannerControl(Protocol):
+    """Управление сканированием.
+
+    Порт намеренно узкий: подсистема команд не знает ни планировщика, ни
+    сканеров — она только сообщает намерение оператора
+    (``CLAUDE.md`` §35).
+    """
+
+    def state(self) -> ScannerRunState:
+        """Текущее состояние сканирования."""
+        ...
+
+    def start(self) -> bool:
+        """Разрешить сканирование. ``True``, если состояние изменилось."""
+        ...
+
+    def stop(self) -> bool:
+        """Запретить новые циклы. ``True``, если состояние изменилось."""
+        ...
+
+    def request_restart(self) -> None:
+        """Запросить перезапуск процесса."""
         ...

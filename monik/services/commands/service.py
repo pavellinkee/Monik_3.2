@@ -146,7 +146,11 @@ class CommandService:
     async def _reply(self, response: CommandResponse) -> None:
         try:
             await self.transport.send(
-                OutgoingMessage(destination=self.destination, text=response.text)
+                OutgoingMessage(
+                    destination=self.destination,
+                    text=response.text,
+                    buttons=response.buttons,
+                )
             )
         except MonikError as error:
             _LOGGER.warning(

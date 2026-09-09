@@ -16,8 +16,11 @@ import signal
 import sys
 from collections.abc import Sequence
 
+from monik import __version__, version_label
+from monik.app.control import RESTART_EXIT_CODE
 from monik.app.lifecycle import Application, create_application
 from monik.config import configuration_diagnostics, load_configuration
+from monik.config.sections.application import Environment
 from monik.domain.enums.health import SupervisorState
 from monik.domain.errors import MonikError
 from monik.services.observability import configure_logging, secret_registry
@@ -48,6 +51,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="validate the configuration and exit without starting workers",
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=version_label(),
+        help="print the application version and exit",
+    )
     return parser
 
 
@@ -55,6 +64,25 @@ async def _run(config_path: str, *, check_only: bool) -> int:
     """Загрузить конфигурацию и выполнить жизненный цикл приложения."""
     loaded = load_configuration(config_path, registry=secret_registry)
     configure_logging(level=loaded.config.logging.level.value, registry=secret_registry)
+    environment = loaded.config.application.environment
+    _LOGGER.info(
+        "starting %s",
+        version_label(),
+        extra=log_fields(
+            application_version=__version__,
+            environment=environment.value,
+        ),
+    )
+    if environment is Environment.DEVELOPMENT:
+        # Значение по умолчанию. Боевой запуск обязан задать окружение
+        # явно, иначе диагностика и уведомления называют production
+        # development (``17_CONFIGURATION.md`` §13).
+        _LOGGER.warning(
+            "application environment is 'development' (the default); "
+            "set application.environment or MONIK__APPLICATION__ENVIRONMENT "
+            "to 'production' on a production deployment",
+            extra=log_fields(environment=environment.value),
+        )
     _LOGGER.info("configuration loaded", extra=log_fields(**configuration_diagnostics(loaded)))
     if check_only:
         return 0
@@ -64,6 +92,7 @@ async def _run(config_path: str, *, check_only: bool) -> int:
         await application.startup()
         _install_signal_handlers(application)
         state = await application.run()
+        restart_requested = application.container.control.restart_requested
     finally:
         await application.shutdown()
         await database.close()
@@ -71,6 +100,11 @@ async def _run(config_path: str, *, check_only: bool) -> int:
     if state is SupervisorState.SAFE_STOP:
         _LOGGER.error("application stopped in SAFE_STOP")
         return _EXIT_SAFE_STOP
+    if restart_requested:
+        # Отдельный код возврата отличает запрошенный перезапуск от
+        # обычной остановки. Поднимает процесс менеджер служб.
+        _LOGGER.warning("application stopped for a requested restart")
+        return RESTART_EXIT_CODE
     return 0
 
 

@@ -15,6 +15,7 @@ __all__ = [
     "LEVEL1_SCANS",
     "LEVEL1_SCAN_SECONDS",
     "LEVEL2_AMOUNTS",
+    "LEVEL2_CONFIRMATIONS",
     "LEVEL2_JOBS",
     "LEVEL2_SECONDS",
     "NOTIFICATIONS",
@@ -44,6 +45,11 @@ LEVEL2_JOBS = "level2_jobs"
 
 #: Результаты проверки отдельных сумм.
 LEVEL2_AMOUNTS = "level2_amounts"
+
+#: Confirmation-статусы сумм (``CLAUDE.md`` §26): источник confirmation
+#: rate. Отличается от ``LEVEL2_AMOUNTS``, где статус — результат
+#: проверки, а не подтверждение.
+LEVEL2_CONFIRMATIONS = "level2_confirmations"
 
 #: Длительность подтверждения Level 2.
 LEVEL2_SECONDS = "level2_confirmation"

@@ -86,6 +86,7 @@ def request(
     deduplication_key: str | None = None,
     batch_units: int = 1,
     created_at: object = None,
+    priority_at: object = None,
 ) -> ResourceRequest:
     """Запрос к ресурсу с предсказуемыми параметрами."""
     return ResourceRequest(
@@ -97,4 +98,5 @@ def request(
         sequence=sequence,
         deduplication_key=deduplication_key,
         batch_units=batch_units,
+        priority_at=priority_at,  # type: ignore[arg-type]
     )

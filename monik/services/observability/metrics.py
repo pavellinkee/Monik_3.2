@@ -120,6 +120,14 @@ class MetricsRegistry:
         """Текущее значение счётчика."""
         return self.counters.get((name, self._labels(labels)), 0)
 
+    def total(self, name: str) -> int:
+        """Сумма счётчика по всем сочетаниям labels.
+
+        Нужна там, где важно общее число событий, а не разбивка по
+        статусам — например «сколько всего циклов Level 1 выполнено».
+        """
+        return sum(value for (metric, _), value in self.counters.items() if metric == name)
+
     def timing(self, name: str, **labels: str) -> TimingStats | None:
         """Агрегированная длительность."""
         return self.timings.get((name, self._labels(labels)))

@@ -47,30 +47,30 @@ class RateLimiter:
         self._updated_at = clock.monotonic()
 
     @property
-    def available_tokens(self) -> float:
-        """Доступные токены на текущий момент."""
-        self._refill()
-        return self._tokens
+    def burst(self) -> int:
+        """Максимальная стоимость запроса, которую корзина может выдать."""
+        return self._limits.burst
 
-    def try_consume(self, units: int = 1) -> bool:
-        """Попытаться списать стоимость запроса."""
+    def reserve(self, units: int = 1) -> float:
+        """Занять место в очереди и вернуть паузу перед выполнением.
+
+        Стоимость списывается сразу, поэтому корзина может уйти в минус:
+        это и есть очередь ожидающих. Возвращённая пауза — время, через
+        которое долг будет покрыт пополнением.
+
+        Такая резервация заменяет цикл «подождать и попробовать снова».
+        Цикл был неверен дважды: ожидающие просыпались одновременно и
+        соревновались за одни и те же токены, теряя порядок очереди, а
+        погрешность вещественной арифметики могла оставить не хватать
+        десятитысячных долей токена — и цикл повторялся вхолостую.
+        """
         if units < 1:
             raise ValueError("units must be at least 1")
         self._refill()
-        if self._tokens + 1e-9 < units:
-            return False
         self._tokens -= units
-        return True
-
-    def wait_time(self, units: int = 1) -> float:
-        """Сколько секунд ждать до появления нужного количества токенов."""
-        if units < 1:
-            raise ValueError("units must be at least 1")
-        self._refill()
-        missing = units - self._tokens
-        if missing <= 0:
+        if self._tokens >= 0:
             return 0.0
-        return missing / self._limits.requests_per_second
+        return -self._tokens / self._limits.requests_per_second
 
     def _refill(self) -> None:
         now = self._clock.monotonic()

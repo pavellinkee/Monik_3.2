@@ -97,18 +97,26 @@ class TelegramNotificationAdapter:
 
     @staticmethod
     def _reply_markup(message: OutgoingMessage) -> dict[str, Any] | None:
-        """Inline-кнопка ``об`` (``CLAUDE.md`` §35).
+        """Inline-клавиатура сообщения.
 
-        Кнопка несёт только ссылку на сохранённое уведомление: обработка
-        нажатия не выполняет нового API-запроса.
+        Кнопка ``об`` присутствует в каждом уведомлении о возможности
+        (``CLAUDE.md`` §35) и несёт только ссылку на сохранённое
+        уведомление: обработка нажатия не выполняет нового API-запроса.
+        Остальные ряды — кнопки управления.
         """
-        if message.details_callback is None or message.details_label is None:
-            return None
-        return {
-            "inline_keyboard": [
+        rows: list[list[dict[str, str]]] = []
+        if message.details_callback is not None and message.details_label is not None:
+            rows.append(
                 [{"text": message.details_label, "callback_data": message.details_callback}]
-            ]
-        }
+            )
+        rows.extend(
+            [{"text": button.label, "callback_data": button.callback_data} for button in row]
+            for row in message.buttons
+            if row
+        )
+        if not rows:
+            return None
+        return {"inline_keyboard": rows}
 
     async def _request(self, payload: dict[str, Any], message: OutgoingMessage) -> HttpResponse:
         request = ResourceRequest(

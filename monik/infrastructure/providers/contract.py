@@ -13,7 +13,7 @@ Adapter не принимает бизнес-решений (``06_AGGREGATOR_ADA
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Protocol, runtime_checkable
 
 from monik.domain.enums.health import AdapterState
@@ -68,6 +68,11 @@ class QuoteRequest:
     # Level 1 (``CLAUDE.md`` §15).
     priority: RequestPriority = RequestPriority.LEVEL1_BUY
     timeout: timedelta | None = None
+    # Момент начала работы, породившей запрос. Внутри одного приоритета
+    # обслуживание идёт по нему, а не по времени создания конкретного
+    # запроса: проверка Level 2, начатая раньше, не должна уступать
+    # начатой позже (``05_RESOURCE_MANAGER.md`` §17-18).
+    priority_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.input_token.network_id != self.network_id:

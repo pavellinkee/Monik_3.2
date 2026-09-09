@@ -13,17 +13,22 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
+from math import floor
 from urllib.parse import urlsplit
 
+from monik import version_label
+from monik.app.control import ScannerSwitch
 from monik.config.loader import LoadedConfiguration
 from monik.config.root import Configuration
 from monik.config.secrets import SecretValue
 from monik.config.sections.fees import GasSource, PriceSource
 from monik.config.sections.providers import ProviderConfig
+from monik.domain.enums.lifecycle import AmountConfirmationStatus
 from monik.domain.enums.notifications import DestinationKind
 from monik.domain.enums.providers import ProviderId
 from monik.domain.errors import ConfigurationError
 from monik.domain.models.notification import NotificationDestination
+from monik.domain.models.resource import ResourceKey
 from monik.infrastructure.db import Database
 from monik.infrastructure.http import HttpClient, HttpxClient, UrlPolicy
 from monik.infrastructure.providers.contract import AggregatorAdapter
@@ -51,11 +56,14 @@ from monik.repositories.sqlite import (
     SqliteSchedulerRepository,
     SqliteStateTransitionRepository,
 )
+from monik.services.backup import BackupService
 from monik.services.calculator import ProfitCalculator
 from monik.services.commands import (
+    BackupStatus,
     CommandRouter,
     CommandService,
     ComponentStatus,
+    ProviderStatus,
     StatsSnapshot,
 )
 from monik.services.fees.policy import FeePolicy, QuoteInclusiveFeePolicy
@@ -85,9 +93,10 @@ from monik.services.notifications import (
     NotificationDispatcher,
     SystemNotifier,
 )
-from monik.services.observability import MetricsRegistry, TransitionRecorder
+from monik.services.observability import MetricsRegistry, TransitionRecorder, names
 from monik.services.observability.clock import Clock
 from monik.services.opportunity import OpportunityService
+from monik.services.opportunity.statistics import ConfirmationStatistics
 from monik.services.prices.conversion import ConversionService
 from monik.services.prices.providers import (
     AggregatorQuotePriceProvider,
@@ -100,7 +109,7 @@ from monik.services.registries import (
     ProviderRegistry,
     TokenRegistry,
 )
-from monik.services.resources import ResourceManager
+from monik.services.resources import ResourceLimits, ResourceManager
 
 __all__ = ["Container", "Repositories", "build_container"]
 
@@ -157,6 +166,8 @@ class Container:
     telegram: TelegramNotificationAdapter | None = None
     formatter: MessageFormatter | None = None
     system_notifier: SystemNotifier | None = None
+    control: ScannerSwitch = field(default_factory=ScannerSwitch)
+    backups: BackupService | None = None
 
     async def aclose(self) -> None:
         """Освободить внешние ресурсы."""
@@ -203,6 +214,7 @@ def build_container(
     config = loaded.config
     registry = metrics or MetricsRegistry()
     health = HealthMonitor(config.health, clock)
+    control = ScannerSwitch()
     url_policy = UrlPolicy(_allowed_hosts(loaded))
     clients: list[HttpClient] = []
 
@@ -212,6 +224,7 @@ def build_container(
         return client
 
     resources = ResourceManager(config.resources, clock)
+    _register_provider_limits(config, resources)
     built_adapters = (
         dict(adapters)
         if adapters is not None
@@ -311,6 +324,9 @@ def build_container(
         clock=clock,
         metrics=registry,
     )
+    backups = BackupService(
+        config.database, database=database, clock=clock, state=repositories.metadata
+    )
     commands = _build_commands(
         loaded,
         repositories=repositories,
@@ -319,6 +335,9 @@ def build_container(
         resources=resources,
         clock=clock,
         health=health,
+        metrics=registry,
+        control=control,
+        backups=backups,
     )
     system_notifier = _build_system_notifier(
         loaded, telegram=telegram, repositories=repositories, clock=clock
@@ -352,6 +371,8 @@ def build_container(
         telegram=telegram,
         formatter=formatter,
         system_notifier=system_notifier,
+        control=control,
+        backups=backups,
     )
 
 
@@ -670,6 +691,37 @@ def _build_telegram(
     )
 
 
+def _register_provider_limits(config: Configuration, resources: ResourceManager) -> None:
+    """Передать Resource Manager лимиты включённых провайдеров.
+
+    Без этого шага ``requests_per_second`` и ``max_concurrent_requests``
+    остаются объявленными, но не действующими: Resource Manager не находит
+    лимитов для ресурса и пропускает запросы без ограничения частоты
+    (``CLAUDE.md`` §14, ``05_RESOURCE_MANAGER.md`` §58).
+
+    Лимиты регистрируются на **уровне провайдера**, без сети и операции.
+    Это создаёт одну очередь на агрегатор, а значит BUY и SELL, Level 1 и
+    Level 2, котировки и комиссии делят общий бюджет: API ограничивает ключ
+    целиком, и разделять его на независимые корзины нельзя
+    (``05_RESOURCE_MANAGER.md`` §51). Очередь появляется из конфигурации,
+    поэтому новый агрегатор не требует изменений в самой очереди.
+
+    ``burst`` отдельным параметром не задаётся: второй источник истины для
+    частоты запросов создавать нельзя. Он выводится из
+    ``requests_per_second`` и берётся строго меньше её, чтобы стартовый
+    запас не выдавал за первую секунду больше настроенной частоты.
+    """
+    for provider in config.enabled_providers:
+        resources.register_limits(
+            ResourceKey(provider_id=provider.provider_id),
+            ResourceLimits(
+                max_concurrent=provider.max_concurrent_requests,
+                requests_per_second=provider.requests_per_second,
+                burst=max(1, floor(provider.requests_per_second)),
+            ),
+        )
+
+
 def _build_system_notifier(
     loaded: LoadedConfiguration,
     *,
@@ -707,6 +759,9 @@ def _build_commands(
     resources: ResourceManager,
     clock: Clock,
     health: HealthMonitor,
+    metrics: MetricsRegistry,
+    control: ScannerSwitch,
+    backups: BackupService,
 ) -> CommandService | None:
     """Входящий канал команд, если он включён конфигурацией."""
     config = loaded.config.notifications.telegram
@@ -719,7 +774,13 @@ def _build_commands(
         jobs=repositories.jobs,
         notifications=repositories.notifications,
         status=_HealthStatusSource(health),
-        stats=_MetricsStatsSource(),
+        stats=_MetricsStatsSource(metrics),
+        providers=_ProviderStatusSource(health, resources, loaded.config),
+        scans=repositories.scans,
+        control=control,
+        backups=_BackupStatusSource(backups),
+        application=version_label(),
+        environment=loaded.config.application.environment.value,
     )
     return CommandService(
         router=router,
@@ -768,20 +829,97 @@ class _HealthStatusSource:
         )
 
 
+class _ProviderStatusSource:
+    """Состояние агрегаторов для команд.
+
+    Собирается из двух уже существующих источников: Health Monitoring
+    знает доступность, Resource Manager — очередь и применённые лимиты.
+    Третьего хранилища состояния не создаётся.
+    """
+
+    def __init__(
+        self, health: HealthMonitor, resources: ResourceManager, config: Configuration
+    ) -> None:
+        self._health = health
+        self._resources = resources
+        self._config = config
+
+    def providers(self) -> tuple[ProviderStatus, ...]:
+        """Состояние каждого включённого агрегатора."""
+        queues = {snapshot.resource: snapshot for snapshot in self._resources.queue_snapshots()}
+        statuses = []
+        for provider in self._config.enabled_providers:
+            name = provider.provider_id.value
+            health = self._health.provider(provider.provider_id)
+            queue = queues.get(name)
+            statuses.append(
+                ProviderStatus(
+                    provider=name,
+                    health=health.status.value,
+                    circuit_state=queue.circuit_state.value if queue else "unknown",
+                    requests_per_second=provider.requests_per_second,
+                    max_concurrent=provider.max_concurrent_requests,
+                    active=queue.active if queue else 0,
+                    waiting=queue.waiting if queue else 0,
+                    reason=health.reason,
+                )
+            )
+        return tuple(statuses)
+
+
+class _BackupStatusSource:
+    """Состояние резервного копирования для команды ``/backup``."""
+
+    def __init__(self, backups: BackupService) -> None:
+        self._backups = backups
+
+    async def status(self) -> BackupStatus:
+        """Текущее состояние копий."""
+        if not self._backups.enabled:
+            return BackupStatus(enabled=False)
+        last_run, outcome = await self._backups.last_run()
+        directory = self._backups.directory
+        return BackupStatus(
+            enabled=True,
+            last_run_at=last_run,
+            last_outcome=outcome,
+            copies=len(self._backups.copies()),
+            # Путь каталога секретом не является и нужен оператору.
+            detail=f"Каталог: {directory}" if directory else None,
+        )
+
+
 class _MetricsStatsSource:
     """Статистика для команды ``/stats``.
 
-    Значения накапливает Opportunity Service и подсистемы; здесь они только
-    отдаются командой. Пересчёта не выполняется.
+    Читает **живой** реестр метрик, который наполняют Level 1, Level 2 и
+    Notification System во время работы. Собственных счётчиков здесь нет:
+    вторая система метрик создавала бы второй источник истины
+    (``28_OBSERVABILITY.md`` §29).
+
+    Значения накапливаются с момента запуска процесса: реестр метрик
+    хранится в памяти и обнуляется при перезапуске.
     """
 
-    def __init__(self) -> None:
-        self._snapshot = StatsSnapshot()
-
-    def update(self, snapshot: StatsSnapshot) -> None:
-        """Обновить отдаваемую статистику."""
-        self._snapshot = snapshot
+    def __init__(self, metrics: MetricsRegistry) -> None:
+        self._metrics = metrics
 
     def snapshot(self) -> StatsSnapshot:
-        """Текущая статистика."""
-        return self._snapshot
+        """Текущая статистика из реестра метрик."""
+        return StatsSnapshot(
+            confirmations=ConfirmationStatistics(
+                confirmed=self._confirmations(AmountConfirmationStatus.CONFIRMED),
+                unconfirmed=self._confirmations(AmountConfirmationStatus.UNCONFIRMED),
+                partial=self._confirmations(AmountConfirmationStatus.PARTIAL),
+            ),
+            # Учитываются все завершённые циклы независимо от итогового
+            # статуса: пользователь спрашивает, сколько раз сканер отработал.
+            scans_completed=self._metrics.total(names.LEVEL1_SCANS),
+            opportunities_created=self._metrics.counter(
+                names.LEVEL1_OPPORTUNITIES, status="created"
+            ),
+            notifications_sent=self._metrics.counter(names.NOTIFICATIONS, outcome="delivered"),
+        )
+
+    def _confirmations(self, status: AmountConfirmationStatus) -> int:
+        return self._metrics.counter(names.LEVEL2_CONFIRMATIONS, status=status.value)

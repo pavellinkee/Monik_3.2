@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import importlib
+import pathlib
 import pkgutil
+import re
+import tomllib
 
 import pytest
 
@@ -47,7 +50,23 @@ EXPECTED_PACKAGES = [
 
 
 def test_version_is_exposed() -> None:
-    assert monik.__version__ == "0.1.0"
+    """Версия объявлена и выглядит как версия."""
+    assert re.fullmatch(r"\d+\.\d+\.\d+", monik.__version__), monik.__version__
+
+
+def test_version_label_names_the_application() -> None:
+    assert monik.version_label() == f"{monik.APPLICATION_NAME} {monik.__version__}"
+
+
+def test_pyproject_version_matches_the_package() -> None:
+    """Единственный источник истины версии (``CLAUDE.md`` §18).
+
+    Дублировать номер версии в тесте нельзя: тогда он сам стал бы вторым
+    источником. Проверяется совпадение объявленных значений.
+    """
+    pyproject = pathlib.Path(__file__).resolve().parents[2] / "pyproject.toml"
+    declared = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
+    assert declared == monik.__version__
 
 
 @pytest.mark.parametrize("module_name", EXPECTED_PACKAGES)

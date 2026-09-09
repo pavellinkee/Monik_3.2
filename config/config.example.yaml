@@ -11,6 +11,9 @@
 # Приоритет: environment override > этот файл > безопасный default.
 
 application:
+  # ВАЖНО: боевой запуск обязан задать production здесь либо переменной
+  # MONIK__APPLICATION__ENVIRONMENT=production. Значение по умолчанию —
+  # development, и именно оно попадёт в логи, /status и уведомления.
   environment: development        # development | test | production
   timezone: "Europe/Lisbon"
   shutdown_timeout_seconds: 30
@@ -27,6 +30,11 @@ networks:
 
 # Провайдер включается только вместе с заданной переменной окружения
 # для его ключа: enabled-провайдер без доступного секрета останавливает старт.
+#
+# requests_per_second и max_concurrent_requests применяются Resource Manager
+# к очереди этого провайдера. Очередь одна на агрегатор: BUY и SELL,
+# Level 1 и Level 2, котировки и комиссии делят общий бюджет, потому что
+# API ограничивает ключ целиком (05_RESOURCE_MANAGER.md §51).
 providers:
   - provider_id: oneinch
     enabled: true
@@ -208,6 +216,12 @@ scheduler:
       time: "03:30"
       timezone: "Europe/Lisbon"
       interval_days: 1
+    # Резервное копирование базы. weekday по ISO: 1 — понедельник, 6 — суббота.
+    backup:
+      mode: weekly
+      weekday: 6
+      time: "03:00"
+      timezone: "Europe/Lisbon"
 
 health:
   enabled: true
@@ -257,6 +271,12 @@ notifications:
 
 database:
   path: "data/monik.db"
+  # Резервное копирование. Копируется только сама база: она является
+  # source of truth восстановимого состояния (CLAUDE.md §28). Виртуальное
+  # окружение, репозиторий, кэши, логи и секреты в копию не попадают.
+  backup_enabled: false
+  backup_directory: "data/backups"
+  backup_retention_copies: 8      # старые копии удаляются автоматически
   wal_enabled: true
   busy_timeout_seconds: 5.0
   integrity_check_on_startup: true

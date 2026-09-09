@@ -16,9 +16,10 @@ __all__ = ["SchedulerConfig", "TaskScheduleConfig"]
 class TaskScheduleConfig(ConfigSection):
     """Расписание одной задачи (``17_CONFIGURATION.md`` §44).
 
-    Поддерживаются режимы STARTUP, INTERVAL, DAILY и MANUAL
-    (``14_SCHEDULER.md`` §12-15). Для DAILY обязательны время в формате
-    ``HH:MM`` и валидная IANA timezone (``17_CONFIGURATION.md`` §18-19).
+    Поддерживаются режимы STARTUP, INTERVAL, DAILY, WEEKLY и MANUAL
+    (``14_SCHEDULER.md`` §12-15). Для DAILY и WEEKLY обязательны время в
+    формате ``HH:MM`` и валидная IANA timezone (``17_CONFIGURATION.md``
+    §18-19); WEEKLY дополнительно требует день недели.
     """
 
     enabled: bool = True
@@ -26,6 +27,8 @@ class TaskScheduleConfig(ConfigSection):
     interval_seconds: int | None = Field(default=None, ge=1, le=86_400)
     interval_days: int | None = Field(default=None, ge=1, le=365)
     time: str | None = Field(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    #: День недели для WEEKLY по ISO: 1 — понедельник, 6 — суббота.
+    weekday: int | None = Field(default=None, ge=1, le=7)
     timezone: str | None = Field(default=None, min_length=1, max_length=64)
     overlap_policy: OverlapPolicy = OverlapPolicy.SKIP
 
@@ -35,13 +38,18 @@ class TaskScheduleConfig(ConfigSection):
             raise ValueError("INTERVAL task requires interval_seconds")
         if self.mode is not TaskMode.INTERVAL and self.interval_seconds is not None:
             raise ValueError(f"interval_seconds is not applicable to {self.mode.value} task")
-        if self.mode is TaskMode.DAILY:
+        if self.mode in {TaskMode.DAILY, TaskMode.WEEKLY}:
             if self.time is None:
-                raise ValueError("DAILY task requires time in HH:MM format")
+                raise ValueError(f"{self.mode.value.upper()} task requires time in HH:MM format")
             if self.timezone is None:
-                raise ValueError("DAILY task requires an explicit timezone")
+                raise ValueError(f"{self.mode.value.upper()} task requires an explicit timezone")
         elif self.time is not None:
             raise ValueError(f"time is not applicable to {self.mode.value} task")
+        if self.mode is TaskMode.WEEKLY:
+            if self.weekday is None:
+                raise ValueError("WEEKLY task requires weekday (1 = Monday .. 7 = Sunday)")
+        elif self.weekday is not None:
+            raise ValueError(f"weekday is not applicable to {self.mode.value} task")
         if self.timezone is not None:
             try:
                 ZoneInfo(self.timezone)

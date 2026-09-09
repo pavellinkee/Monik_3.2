@@ -1,0 +1,363 @@
+"""Управление Monik из Telegram: меню, кнопки и подтверждения.
+
+Требования — ``docs/telegram_commands.md``. Опасные действия выполняются
+только после явного подтверждения, а ответы не содержат секретов
+(``19_HEALTH_MONITORING.md`` §65).
+"""
+
+from __future__ import annotations
+
+import pathlib
+from collections.abc import AsyncIterator
+
+import pytest
+
+from monik.app.control import ScannerSwitch
+from monik.config.sections.database import DatabaseConfig
+from monik.domain.enums.control import ScannerRunState
+from monik.domain.enums.lifecycle import ScanStatus
+from monik.domain.models.scan import Scan, ScanScope, ScanStatistics
+from monik.infrastructure.db import Database, MigrationRunner
+from monik.repositories.sqlite import SqliteJobRepository, SqliteNotificationRepository
+from monik.services.commands import (
+    BackupStatus,
+    CommandName,
+    CommandRouter,
+    ProviderStatus,
+    parse_command,
+)
+from monik.services.commands.parser import action_callback_data, confirm_callback_data
+from tests import factories as f
+
+from .test_commands import StaticStats, StaticStatus
+
+SECRETS = (
+    "sk-live-должен-остаться-невидимым",
+    "1234567890:AAH-bot-token",
+    "0xprivatekey",
+)
+
+
+@pytest.fixture
+async def database(tmp_path: pathlib.Path) -> AsyncIterator[Database]:
+    instance = Database(DatabaseConfig(path=str(tmp_path / "control.db"), busy_timeout_seconds=1.0))
+    await instance.connect()
+    await MigrationRunner(instance).upgrade()
+    try:
+        yield instance
+    finally:
+        await instance.close()
+
+
+class StaticProviders:
+    """Снимок очередей агрегаторов."""
+
+    def __init__(self, statuses: tuple[ProviderStatus, ...] | None = None) -> None:
+        self._statuses = (
+            statuses
+            if statuses is not None
+            else (
+                ProviderStatus(
+                    provider="zero_x",
+                    health="healthy",
+                    circuit_state="closed",
+                    requests_per_second=4.9,
+                    max_concurrent=4,
+                    active=1,
+                    waiting=0,
+                ),
+                ProviderStatus(
+                    provider="uniswap",
+                    health="degraded",
+                    circuit_state="open",
+                    requests_per_second=5.9,
+                    max_concurrent=2,
+                    active=0,
+                    waiting=3,
+                    reason="provider_rate_limited",
+                ),
+            )
+        )
+
+    def providers(self) -> tuple[ProviderStatus, ...]:
+        return self._statuses
+
+
+class StaticScans:
+    """Последние циклы Level 1."""
+
+    def __init__(self, scans: tuple[Scan, ...] = ()) -> None:
+        self._scans = scans
+
+    async def recent(self, *, limit: int) -> tuple[Scan, ...]:
+        return self._scans[:limit]
+
+
+class StaticBackups:
+    def __init__(self, status: BackupStatus | None = None) -> None:
+        self._status = status or BackupStatus(
+            enabled=True,
+            last_run_at="2026-01-03T03:00:00+00:00",
+            last_outcome="success",
+            copies=8,
+        )
+
+    async def status(self) -> BackupStatus:
+        return self._status
+
+
+def build_router(database: Database, **overrides: object) -> CommandRouter:
+    return CommandRouter(
+        jobs=SqliteJobRepository(database),
+        notifications=SqliteNotificationRepository(database),
+        status=overrides.get("status") or StaticStatus(),  # type: ignore[arg-type]
+        stats=overrides.get("stats") or StaticStats(),  # type: ignore[arg-type]
+        providers=overrides.get("providers", StaticProviders()),  # type: ignore[arg-type]
+        scans=overrides.get("scans", StaticScans()),  # type: ignore[arg-type]
+        control=overrides.get("control", ScannerSwitch()),  # type: ignore[arg-type]
+        backups=overrides.get("backups", StaticBackups()),  # type: ignore[arg-type]
+        application=overrides.get("application", "Monik 3.2.0"),  # type: ignore[arg-type]
+        environment=overrides.get("environment", "production"),  # type: ignore[arg-type]
+    )
+
+
+def _finished_scan() -> Scan:
+    return Scan(
+        scan_id=f.ScanId("33333333-3333-4333-8333-333333333333"),
+        status=ScanStatus.COMPLETE,
+        scope=ScanScope(
+            networks=(f.POLYGON,),
+            providers=(f.ProviderId.ZERO_X,),
+            tokens=(f.AAVE.key,),
+            raw_amounts=(100_000_000,),
+        ),
+        statistics=ScanStatistics(
+            quote_requests=240, successful_quotes=238, opportunities_created=2
+        ),
+        started_at=f.NOW,
+        finished_at=f.NOW,
+    )
+
+
+# --- разбор новых команд ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("/menu", CommandName.MENU),
+        ("/help", CommandName.HELP),
+        ("/start", CommandName.START_SCANNER),
+        ("/stop", CommandName.STOP_SCANNER),
+        ("/restart", CommandName.RESTART),
+        ("/providers", CommandName.PROVIDERS),
+        ("/providers uniswap", CommandName.PROVIDERS),
+        ("/scans", CommandName.SCANS),
+        ("/backup", CommandName.BACKUP),
+    ],
+)
+def test_control_commands_are_parsed(text: str, expected: CommandName) -> None:
+    assert parse_command(text).name is expected
+
+
+# --- меню и помощь ---------------------------------------------------------
+
+
+async def test_menu_offers_the_required_buttons(database: Database) -> None:
+    """Минимальный набор кнопок из задания."""
+    response = await build_router(database).handle_text("/menu")
+
+    labels = [button.label for row in response.buttons for button in row]
+    assert "▶️ Запустить" in labels
+    assert "⏸ Остановить" in labels
+    assert "🔄 Перезапустить" in labels
+    assert "📊 Статус" in labels
+    assert "🔌 Статус агрегатора" in labels
+
+
+async def test_help_lists_every_documented_command(database: Database) -> None:
+    response = await build_router(database).handle_text("/help")
+
+    for command in ("/menu", "/status", "/providers", "/scans", "/backup", "/restart"):
+        assert command in response.text
+
+
+async def test_menu_hides_control_buttons_without_a_port(database: Database) -> None:
+    """Без порта управления кнопки, которые ничего не сделают, не показываются."""
+    response = await build_router(database, control=None).handle_text("/menu")
+
+    labels = [button.label for row in response.buttons for button in row]
+    assert "▶️ Запустить" not in labels
+    assert "📊 Статус" in labels
+
+
+# --- подтверждение опасных действий ---------------------------------------
+
+
+@pytest.mark.parametrize("text", ["/stop", "/restart"])
+async def test_destructive_command_asks_for_confirmation(database: Database, text: str) -> None:
+    """Команда сама действие не выполняет."""
+    control = ScannerSwitch()
+    response = await build_router(database, control=control).handle_text(text)
+
+    assert "?" in response.text
+    assert [button.label for row in response.buttons for button in row] == ["✅ Да", "↩️ Отмена"]
+    assert control.state() is ScannerRunState.RUNNING
+    assert not control.restart_requested
+
+
+async def test_stop_requires_the_confirmation_button(database: Database) -> None:
+    control = ScannerSwitch()
+    router = build_router(database, control=control)
+
+    await router.handle_callback(action_callback_data(CommandName.STOP_SCANNER))
+    assert control.is_running, "нажатие кнопки меню ещё не подтверждение"
+
+    await router.handle_callback(confirm_callback_data(CommandName.STOP_SCANNER))
+    assert control.state() is ScannerRunState.PAUSED
+
+
+async def test_cancel_returns_to_the_menu_without_changing_anything(database: Database) -> None:
+    control = ScannerSwitch()
+    router = build_router(database, control=control)
+
+    await router.handle_text("/stop")
+    response = await router.handle_callback(action_callback_data(CommandName.MENU))
+
+    assert control.is_running
+    assert response.buttons
+
+
+async def test_restart_is_requested_only_after_confirmation(database: Database) -> None:
+    control = ScannerSwitch()
+    router = build_router(database, control=control)
+
+    await router.handle_text("/restart")
+    assert not control.restart_requested
+
+    await router.handle_callback(confirm_callback_data(CommandName.RESTART))
+    assert control.restart_requested
+    assert control.state() is ScannerRunState.RESTARTING
+
+
+async def test_start_resumes_scanning(database: Database) -> None:
+    control = ScannerSwitch()
+    control.stop()
+    router = build_router(database, control=control)
+
+    response = await router.handle_callback(action_callback_data(CommandName.START_SCANNER))
+
+    assert control.is_running
+    assert response.handled
+
+
+async def test_repeated_start_is_reported_as_no_change(database: Database) -> None:
+    router = build_router(database, control=ScannerSwitch())
+
+    response = await router.handle_callback(action_callback_data(CommandName.START_SCANNER))
+
+    assert "уже" in response.text
+
+
+# --- состояние -------------------------------------------------------------
+
+
+async def test_status_shows_version_environment_and_queues(database: Database) -> None:
+    response = await build_router(database).handle_text("/status")
+
+    assert "Monik 3.2.0" in response.text
+    assert "production" in response.text
+    assert "сканирование идёт" in response.text
+    assert "zero_x" in response.text
+    assert "4.9 зап/с" in response.text
+
+
+async def test_status_reflects_a_stopped_scanner(database: Database) -> None:
+    control = ScannerSwitch()
+    control.stop()
+
+    response = await build_router(database, control=control).handle_text("/status")
+
+    assert "остановлено оператором" in response.text
+
+
+async def test_providers_offer_a_button_per_aggregator(database: Database) -> None:
+    response = await build_router(database).handle_text("/providers")
+
+    labels = [button.label for row in response.buttons for button in row]
+    assert labels == ["zero_x", "uniswap"]
+
+
+async def test_one_provider_reports_the_reason_for_degradation(database: Database) -> None:
+    response = await build_router(database).handle_text("/providers uniswap")
+
+    assert "Агрегатор uniswap" in response.text
+    assert "open" in response.text
+    assert "provider_rate_limited" in response.text
+
+
+async def test_unknown_provider_lists_the_available_ones(database: Database) -> None:
+    response = await build_router(database).handle_text("/providers oneinch")
+
+    assert response.handled is False
+    assert "zero_x" in response.text
+
+
+async def test_scans_report_the_last_cycles(database: Database) -> None:
+    router = build_router(database, scans=StaticScans((_finished_scan(),)))
+
+    response = await router.handle_text("/scans")
+
+    assert "запросов 240" in response.text
+    assert "возможностей 2" in response.text
+
+
+async def test_scans_report_an_empty_history(database: Database) -> None:
+    response = await build_router(database).handle_text("/scans")
+
+    assert "циклов пока не было" in response.text
+
+
+async def test_backup_reports_the_last_run(database: Database) -> None:
+    response = await build_router(database).handle_text("/backup")
+
+    assert "Копий сохранено: 8" in response.text
+    assert "success" in response.text
+
+
+async def test_backup_reports_being_switched_off(database: Database) -> None:
+    router = build_router(database, backups=StaticBackups(BackupStatus(enabled=False)))
+
+    response = await router.handle_text("/backup")
+
+    assert "выключено" in response.text
+
+
+# --- секреты ---------------------------------------------------------------
+
+
+async def test_no_command_reveals_secrets(database: Database) -> None:
+    """Ни один ответ не содержит ключей, токенов и приватных ключей."""
+    router = build_router(database)
+
+    texts = []
+    for text in (
+        "/menu",
+        "/help",
+        "/status",
+        "/providers",
+        "/providers zero_x",
+        "/scans",
+        "/backup",
+        "/stats",
+        "/level2",
+        "/stop",
+        "/restart",
+    ):
+        texts.append((await router.handle_text(text)).text)
+
+    joined = "\n".join(texts)
+    for secret in SECRETS:
+        assert secret not in joined
+    for marker in ("api_key", "api key", "token", "MONIK_", "private"):
+        assert marker.lower() not in joined.lower()

@@ -1,11 +1,14 @@
 """Разбор входящих команд Telegram.
 
-Поддерживаются команды ``CLAUDE.md`` §36:
-
-``/details K1234`` · ``/level2`` · ``/status`` · ``/stats``
+Набор команд описан в ``docs/telegram_commands.md``. Помимо команд
+``CLAUDE.md`` §36 (``/details``, ``/level2``, ``/status``, ``/stats``)
+поддерживается управление сканером и просмотр состояния агрегаторов.
 
 Некорректный ввод не приводит к ошибке подсистемы: он превращается в
 явный результат разбора, который обработчик показывает пользователю.
+
+Нажатия кнопок разбираются здесь же: кнопка выполняет то же действие, что
+и команда, поэтому второй модели ввода не создаётся.
 """
 
 from __future__ import annotations
@@ -13,20 +16,80 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-__all__ = ["CommandName", "ParsedCommand", "parse_callback", "parse_command"]
+__all__ = [
+    "DESTRUCTIVE_COMMANDS",
+    "CommandName",
+    "ParsedCallback",
+    "ParsedCommand",
+    "action_callback_data",
+    "confirm_callback_data",
+    "details_callback_data",
+    "parse_callback",
+    "parse_command",
+    "provider_callback_data",
+]
 
 #: Префикс callback-данных кнопки ``об``.
 DETAILS_CALLBACK_PREFIX = "details"
+
+#: Префикс кнопки, повторяющей обычную команду.
+ACTION_CALLBACK_PREFIX = "do"
+
+#: Префикс кнопки подтверждения опасного действия.
+CONFIRM_CALLBACK_PREFIX = "confirm"
+
+#: Префикс кнопки выбора конкретного агрегатора.
+PROVIDER_CALLBACK_PREFIX = "provider"
 
 
 class CommandName(StrEnum):
     """Поддерживаемая команда."""
 
-    DETAILS = "details"
-    LEVEL2 = "level2"
+    #: Показать меню кнопок.
+    MENU = "menu"
+    #: Список команд с описанием.
+    HELP = "help"
+    #: Разрешить сканирование.
+    START_SCANNER = "start"
+    #: Запретить новые циклы сканирования.
+    STOP_SCANNER = "stop"
+    #: Перезапустить процесс.
+    RESTART = "restart"
+    #: Сводное состояние приложения.
     STATUS = "status"
+    #: Состояние агрегаторов и их очередей.
+    PROVIDERS = "providers"
+    #: Последние циклы Level 1.
+    SCANS = "scans"
+    #: Активные проверки Level 2.
+    LEVEL2 = "level2"
+    #: Сохранённый результат проверки по ``#K``.
+    DETAILS = "details"
+    #: Накопленная статистика.
     STATS = "stats"
+    #: Состояние резервного копирования.
+    BACKUP = "backup"
+    #: Нераспознанная команда.
     UNKNOWN = "unknown"
+
+
+#: Команды без обязательного аргумента.
+_SIMPLE_COMMANDS = (
+    CommandName.MENU,
+    CommandName.HELP,
+    CommandName.START_SCANNER,
+    CommandName.STOP_SCANNER,
+    CommandName.RESTART,
+    CommandName.STATUS,
+    CommandName.SCANS,
+    CommandName.LEVEL2,
+    CommandName.STATS,
+    CommandName.BACKUP,
+)
+
+#: Действия, прерывающие работу сканера. Выполняются только после явного
+#: подтверждения (``docs/telegram_commands.md``).
+DESTRUCTIVE_COMMANDS = frozenset({CommandName.STOP_SCANNER, CommandName.RESTART})
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +104,44 @@ class ParsedCommand:
     def is_valid(self) -> bool:
         """Распознана ли команда полностью."""
         return self.name is not CommandName.UNKNOWN and self.error is None
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedCallback:
+    """Результат разбора нажатия кнопки.
+
+    Кнопка либо открывает сохранённое уведомление (``details``), либо
+    выполняет команду — в том числе подтверждённую.
+    """
+
+    notification_id: str | None = None
+    command: ParsedCommand | None = None
+    confirmed: bool = False
+
+    @property
+    def is_known(self) -> bool:
+        """Распознано ли нажатие."""
+        return self.notification_id is not None or self.command is not None
+
+
+def details_callback_data(notification_id: str) -> str:
+    """Данные кнопки ``об`` для конкретного уведомления."""
+    return f"{DETAILS_CALLBACK_PREFIX}:{notification_id}"
+
+
+def action_callback_data(command: CommandName) -> str:
+    """Данные кнопки, повторяющей команду."""
+    return f"{ACTION_CALLBACK_PREFIX}:{command.value}"
+
+
+def confirm_callback_data(command: CommandName) -> str:
+    """Данные кнопки подтверждения опасного действия."""
+    return f"{CONFIRM_CALLBACK_PREFIX}:{command.value}"
+
+
+def provider_callback_data(provider: str) -> str:
+    """Данные кнопки выбора агрегатора."""
+    return f"{PROVIDER_CALLBACK_PREFIX}:{provider}"
 
 
 def parse_command(text: str) -> ParsedCommand:
@@ -62,15 +163,38 @@ def parse_command(text: str) -> ParsedCommand:
                 name=CommandName.DETAILS, error="команда /details требует идентификатор K"
             )
         return ParsedCommand(name=CommandName.DETAILS, argument=argument)
-    if raw_name in {CommandName.LEVEL2.value, CommandName.STATUS.value, CommandName.STATS.value}:
-        return ParsedCommand(name=CommandName(raw_name))
+    if raw_name == CommandName.PROVIDERS.value:
+        # Аргумент необязателен: без него показываются все агрегаторы.
+        return ParsedCommand(name=CommandName.PROVIDERS, argument=argument)
+    for command in _SIMPLE_COMMANDS:
+        if raw_name == command.value:
+            return ParsedCommand(name=command)
     return ParsedCommand(name=CommandName.UNKNOWN, error=f"неизвестная команда /{raw_name}")
 
 
-def parse_callback(data: str) -> str | None:
-    """Идентификатор уведомления из callback-данных кнопки ``об``."""
-    prefix = f"{DETAILS_CALLBACK_PREFIX}:"
-    if not data.startswith(prefix):
-        return None
-    notification_id = data[len(prefix) :].strip()
-    return notification_id or None
+def parse_callback(data: str) -> ParsedCallback:
+    """Разобрать данные нажатой кнопки."""
+    prefix, _, payload = data.partition(":")
+    payload = payload.strip()
+    if not payload:
+        return ParsedCallback()
+    if prefix == DETAILS_CALLBACK_PREFIX:
+        return ParsedCallback(notification_id=payload)
+    if prefix == PROVIDER_CALLBACK_PREFIX:
+        return ParsedCallback(command=ParsedCommand(name=CommandName.PROVIDERS, argument=payload))
+    if prefix in {ACTION_CALLBACK_PREFIX, CONFIRM_CALLBACK_PREFIX}:
+        command = _command_by_value(payload)
+        if command is None:
+            return ParsedCallback()
+        return ParsedCallback(
+            command=ParsedCommand(name=command),
+            confirmed=prefix == CONFIRM_CALLBACK_PREFIX,
+        )
+    return ParsedCallback()
+
+
+def _command_by_value(value: str) -> CommandName | None:
+    for command in CommandName:
+        if command is not CommandName.UNKNOWN and command.value == value:
+            return command
+    return None

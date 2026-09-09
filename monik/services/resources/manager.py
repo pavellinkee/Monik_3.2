@@ -17,12 +17,14 @@ import builtins
 import random
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import timedelta
 
 from monik.config.sections.resources import ResourceConfig
 from monik.domain.enums.resources import CircuitState, ResourceResultStatus
 from monik.domain.errors import MonikError, ResourceError, TimeoutError
 from monik.domain.errors.base import ErrorInfo
+from monik.domain.errors.classification import RETRYABLE_CATEGORIES
 from monik.domain.models.resource import ResourceKey, ResourceRequest, ResourceResult
 from monik.services.observability.clock import Clock
 from monik.services.observability.logging import get_logger, log_fields
@@ -32,7 +34,7 @@ from monik.services.resources.gate import PriorityGate
 from monik.services.resources.limits import RateLimiter, ResourceLimits
 from monik.services.resources.retry import RetryPolicy
 
-__all__ = ["ResourceManager", "Sleeper"]
+__all__ = ["QueueSnapshot", "ResourceManager", "Sleeper"]
 
 _LOGGER = get_logger("services.resources")
 
@@ -41,6 +43,18 @@ Sleeper = Callable[[float], Awaitable[None]]
 
 #: Ключ глобального лимита конкурентности.
 _GLOBAL_GATE = "__global__"
+
+
+@dataclass(frozen=True, slots=True)
+class QueueSnapshot:
+    """Состояние одной очереди ресурса."""
+
+    resource: str
+    active: int
+    waiting: int
+    max_concurrent: int
+    requests_per_second: float
+    circuit_state: CircuitState
 
 
 class ResourceManager:
@@ -109,6 +123,45 @@ class ResourceManager:
         """Сколько запросов ожидает глобального разрешения."""
         return self._gates[_GLOBAL_GATE].waiting
 
+    def queue_snapshots(self) -> tuple[QueueSnapshot, ...]:
+        """Состояние очередей с заданными лимитами.
+
+        Нужно для диагностики и команды состояния агрегатора: оператор
+        должен видеть, какая очередь загружена и какой лимит к ней
+        применяется (``05_RESOURCE_MANAGER.md`` §69).
+        """
+        snapshots = []
+        for name, limits in sorted(self._limits.items()):
+            gate = self._gates.get(name)
+            snapshots.append(
+                QueueSnapshot(
+                    resource=name,
+                    active=gate.active if gate else 0,
+                    waiting=gate.waiting if gate else 0,
+                    max_concurrent=limits.max_concurrent,
+                    requests_per_second=limits.requests_per_second,
+                    circuit_state=self._widest_circuit_state(name),
+                )
+            )
+        return tuple(snapshots)
+
+    def _widest_circuit_state(self, scope: str) -> CircuitState:
+        """Наихудшее состояние breaker'ов внутри области.
+
+        Breaker живёт на уровне конкретного endpoint (``05`` §50), поэтому
+        у одной очереди их может быть несколько: показывается самое
+        серьёзное.
+        """
+        states = [
+            breaker.state
+            for name, breaker in self._breakers.items()
+            if name == scope or name.startswith(f"{scope}/")
+        ]
+        for candidate in (CircuitState.OPEN, CircuitState.HALF_OPEN):
+            if candidate in states:
+                return candidate
+        return CircuitState.CLOSED
+
     # --- выполнение --------------------------------------------------------
 
     async def _execute_controlled[T](
@@ -125,12 +178,23 @@ class ResourceManager:
             )
 
         queue_started = time.monotonic()
-        gates = self._gates_for(request.key)
         acquired: list[PriorityGate] = []
         try:
-            for gate in gates:
+            # Сначала очередь ресурса: она задаёт порядок обслуживания и
+            # ограничивает одновременные обращения к этому агрегатору.
+            for gate in self._gates_for(request.key):
                 await gate.acquire(request, timeout=self._config.queue_wait_timeout_seconds)
                 acquired.append(gate)
+            # Пауза по частоте выдерживается до захвата общего потолка:
+            # ожидающий своей доли частоты запрос ничего не выполняет и
+            # места выполняющегося занимать не должен. Иначе общий
+            # потолок стал бы вторым ограничением частоты и удерживал
+            # каждого провайдера ниже настроенного значения
+            # (``05_RESOURCE_MANAGER.md`` §21).
+            await self._await_rate_limit(request)
+            global_gate = self._gates[_GLOBAL_GATE]
+            await global_gate.acquire(request, timeout=self._config.queue_wait_timeout_seconds)
+            acquired.append(global_gate)
             queued_for = time.monotonic() - queue_started
             return await self._run_with_retry(request, operation, breaker, queued_for)
         finally:
@@ -147,7 +211,11 @@ class ResourceManager:
         attempts = 0
         started = time.monotonic()
         while True:
-            await self._await_rate_limit(request)
+            if attempts:
+                # Первая попытка уже оплачена до захвата общего потолка;
+                # повтор — это отдельный запрос и стоит отдельного места
+                # в бюджете частоты.
+                await self._await_rate_limit(request)
             breaker.on_request_started()
             attempts += 1
             try:
@@ -164,8 +232,8 @@ class ResourceManager:
                     request_id=request.request_id,
                     operation=str(request.key),
                 )
-                breaker.on_failure()
                 if not self._retry.should_retry(error.info, attempts_used=attempts):
+                    self._fail_breaker(breaker, error.info)
                     self._record(
                         request, ResourceResultStatus.TIMEOUT, queued_for, started, attempts
                     )
@@ -177,8 +245,8 @@ class ResourceManager:
                         request, ResourceResultStatus.CANCELLED, queued_for, started, attempts
                     )
                     raise
-                breaker.on_failure()
                 if not self._retry.should_retry(error.info, attempts_used=attempts):
+                    self._fail_breaker(breaker, error.info)
                     self._record(
                         request,
                         self._failure_status(error.info),
@@ -194,6 +262,31 @@ class ResourceManager:
                 self._record(request, ResourceResultStatus.SUCCESS, queued_for, started, attempts)
                 return result
 
+    @staticmethod
+    def _fail_breaker(breaker: CircuitBreaker, error: ErrorInfo) -> None:
+        """Учесть отказ логической операции в circuit breaker.
+
+        Два правила, без которых breaker открывается ложно:
+
+        * **одна логическая операция — один отказ.** Метод вызывается
+          только после исчерпания retry budget, а не на каждой попытке:
+          иначе три повтора одного запроса расходовали бы три пятых порога
+          (``12_RESOURCE_MANAGER.md`` §33);
+        * **отказом считается только недоступность ресурса.**
+          Категории, для которых повтор бессмыслен по содержанию ответа
+          (``DATA``, ``VALIDATION``, ``UNSUPPORTED``, ``AUTHENTICATION``),
+          описывают запрос или данные, а не работоспособность провайдера:
+          корректный ответ «для этой пары нет ликвидности» не является
+          сбоем (``05_RESOURCE_MANAGER.md`` §29, ``19_HEALTH_MONITORING.md``
+          §55).
+
+        Классификация берётся из существующей модели ошибок
+        (``18_ERROR_HANDLING.md`` §33-36): второго набора правил здесь не
+        создаётся.
+        """
+        if error.category in RETRYABLE_CATEGORIES:
+            breaker.on_failure()
+
     async def _await_rate_limit(self, request: ResourceRequest) -> None:
         """Дождаться разрешения rate limiter'а.
 
@@ -203,10 +296,18 @@ class ResourceManager:
         limiter = self._rate_limiter(request.key)
         if limiter is None:
             return
-        while not limiter.try_consume(request.batch_units):
-            delay = limiter.wait_time(request.batch_units)
-            if delay <= 0:
-                continue
+        if request.batch_units > limiter.burst:
+            # Такой запрос не станет допустимым никогда: ожидание было бы
+            # бесконечным. Ошибка конфигурации сообщается явно.
+            raise ResourceError(
+                f"batch of {request.batch_units} exceeds the burst allowance "
+                f"of {limiter.burst} for {request.key}",
+                code="resource_batch_too_large",
+                request_id=request.request_id,
+                operation=str(request.key),
+            )
+        delay = limiter.reserve(request.batch_units)
+        if delay > 0:
             await self._sleep(delay)
 
     async def _backoff(self, request: ResourceRequest, error: ErrorInfo, attempts: int) -> None:
@@ -231,14 +332,24 @@ class ResourceManager:
     # --- вспомогательное ---------------------------------------------------
 
     def _gates_for(self, key: ResourceKey) -> tuple[PriorityGate, ...]:
-        """Ворота от самых широких к самым узким.
+        """Ворота ресурса от самых широких к самым узким.
 
-        Детерминированный порядок захвата предотвращает взаимную блокировку
+        Общий потолок сюда не входит: он захватывается последним, уже
+        после паузы по частоте. Порядок захвата одинаков для всех
+        запросов, поэтому взаимная блокировка невозможна
         (``05_RESOURCE_MANAGER.md`` §44).
+
+        Ворота создаются только для областей с заданными лимитами. Иначе
+        запрос проходил бы через цепочку ворот, каждые из которых просто
+        повторяют глобальный лимит: очередь провайдера должна быть одна и
+        соответствовать реальной области ограничения
+        (``05_RESOURCE_MANAGER.md`` §50-51).
         """
-        gates = [self._gates[_GLOBAL_GATE]]
+        gates = []
         for scope in (*key.parents(), key):
-            gates.append(self._gate(str(scope)))
+            name = str(scope)
+            if name in self._limits:
+                gates.append(self._gate(name))
         return tuple(gates)
 
     def _gate(self, name: str) -> PriorityGate:

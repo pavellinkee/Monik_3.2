@@ -41,8 +41,15 @@ class CircuitBreaker:
     def allows_request(self) -> bool:
         """Разрешён ли следующий запрос.
 
-        В ``HALF_OPEN`` пропускается ограниченное число пробных запросов
-        (``12_RESOURCE_MANAGER.md`` §34).
+        В ``HALF_OPEN`` одновременно выполняется ограниченное число пробных
+        запросов (``12_RESOURCE_MANAGER.md`` §34): ``half_open_max_calls``
+        ограничивает **одновременные** пробы, а не их общее число.
+
+        Разница принципиальна. Если считать пробы суммарно, то при
+        ``half_open_max_calls = 1`` и ``success_threshold = 2`` первая же
+        удачная проба исчерпывает лимит, не набрав порога закрытия, и
+        ресурс остаётся в ``HALF_OPEN`` навсегда — восстановление
+        становится невозможным вопреки §68.
         """
         if not self._config.enabled:
             return True
@@ -65,6 +72,9 @@ class CircuitBreaker:
         # Обращение к ``state`` применяет отложенный переход OPEN -> HALF_OPEN,
         # если время восстановления уже истекло.
         if self.state is CircuitState.HALF_OPEN:
+            # Проба завершилась: слот освобождается для следующей, иначе
+            # порог закрытия был бы недостижим.
+            self._half_open_calls = max(0, self._half_open_calls - 1)
             self._successes += 1
             if self._successes >= self._config.success_threshold:
                 self._close()

@@ -31,6 +31,8 @@ class SchedulerTask(DomainModel):
     interval: timedelta | None = None
     interval_days: int | None = Field(default=None, ge=1)
     at_time: time | None = None
+    #: День недели по ISO: 1 — понедельник, 7 — воскресенье.
+    weekday: int | None = Field(default=None, ge=1, le=7)
     timezone_name: str | None = Field(default=None, min_length=1, max_length=64)
     max_attempts: int = Field(default=1, ge=1)
 
@@ -42,13 +44,18 @@ class SchedulerTask(DomainModel):
                 raise ValueError("INTERVAL task requires a positive interval")
         elif self.interval is not None:
             raise ValueError(f"interval is not applicable to {self.mode.value} task")
-        if self.mode is TaskMode.DAILY:
+        if self.mode in {TaskMode.DAILY, TaskMode.WEEKLY}:
             if self.at_time is None:
-                raise ValueError("DAILY task requires at_time")
+                raise ValueError(f"{self.mode.value.upper()} task requires at_time")
             if self.timezone_name is None:
-                raise ValueError("DAILY task requires an explicit timezone")
+                raise ValueError(f"{self.mode.value.upper()} task requires an explicit timezone")
         elif self.at_time is not None:
             raise ValueError(f"at_time is not applicable to {self.mode.value} task")
+        if self.mode is TaskMode.WEEKLY:
+            if self.weekday is None:
+                raise ValueError("WEEKLY task requires a weekday")
+        elif self.weekday is not None:
+            raise ValueError(f"weekday is not applicable to {self.mode.value} task")
         return self
 
 

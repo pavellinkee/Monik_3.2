@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from monik import version_label
 from monik.config.loader import LoadedConfiguration
 from monik.services.observability.redaction import redact_mapping
 
@@ -27,6 +28,9 @@ def configuration_diagnostics(loaded: LoadedConfiguration) -> dict[str, Any]:
     telegram = config.notifications.telegram
     summary: dict[str, Any] = {
         "source": loaded.source,
+        # Версия приложения и отпечаток конфигурации — разные величины:
+        # первая говорит, какой код запущен, вторая — какие настройки.
+        "application_version": version_label(),
         "version": config.version,
         "environment": config.application.environment.value,
         "timezone": config.application.timezone,

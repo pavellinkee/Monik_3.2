@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from monik.domain.enums.calculation import CalculationStatus
 from monik.domain.enums.lifecycle import AmountVerificationStatus
 from monik.domain.models.job import AmountVerificationResult
@@ -38,9 +40,18 @@ class AmountVerifier:
         self._tokens = tokens
 
     async def verify(
-        self, opportunity: Opportunity, amount: OpportunityAmount
+        self,
+        opportunity: Opportunity,
+        amount: OpportunityAmount,
+        *,
+        priority_at: datetime | None = None,
     ) -> AmountVerificationResult:
-        """Проверить сумму по зафиксированному маршруту."""
+        """Проверить сумму по зафиксированному маршруту.
+
+        ``priority_at`` — момент начала проверки Level 2. Он определяет
+        порядок обслуживания внутри приоритета Level 2, поэтому передаётся
+        в обе ноги маршрута.
+        """
         snapshot = opportunity.routes
         input_token = self._tokens.require(snapshot.input_token)
         intermediate_token = self._tokens.require(snapshot.intermediate_token)
@@ -51,6 +62,7 @@ class AmountVerifier:
             input_token=input_token,
             output_token=intermediate_token,
             input_amount=amount.input_amount,
+            priority_at=priority_at,
         )
         if not buy.is_reproduced or buy.quote is None:
             return _route_failure(amount, buy, leg="buy")
@@ -62,6 +74,7 @@ class AmountVerifier:
             output_token=output_token,
             # SELL проверяется именно на текущем BUY output (§16).
             input_amount=current_buy_output,
+            priority_at=priority_at,
         )
         if not sell.is_reproduced or sell.quote is None:
             return _route_failure(amount, sell, leg="sell")

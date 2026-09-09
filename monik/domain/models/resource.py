@@ -78,6 +78,7 @@ class ResourceRequest(DomainModel):
     correlation_id: CorrelationId | None = None
     deduplication_key: str | None = Field(default=None, max_length=256)
     batch_units: int = Field(default=1, ge=1)
+    priority_at: UtcDatetime | None = None
 
     @model_validator(mode="after")
     def _validate(self) -> Self:
@@ -86,14 +87,28 @@ class ResourceRequest(DomainModel):
         return self
 
     @property
-    def ordering_key(self) -> tuple[int, UtcDatetime, int]:
+    def ordering_key(self) -> tuple[int, UtcDatetime, UtcDatetime, int]:
         """Ключ упорядочивания очереди.
 
         Сначала приоритет, затем время постановки и sequence
         (``04_SCHEDULER.md`` §25). Прибыльность в упорядочивании не участвует
         (``04_SCHEDULER.md`` §26).
+
+        ``priority_at`` позволяет упорядочить запросы одного приоритета по
+        времени начала породившей их работы, а не по времени создания
+        конкретного запроса. Это нужно Level 2: проверка, начатая раньше,
+        обслуживается раньше начатой позже, даже если её очередной запрос
+        создан позднее. Без этого более поздняя проверка обгоняла бы более
+        раннюю (``05_RESOURCE_MANAGER.md`` §17-18).
+
+        Для запросов без ``priority_at`` порядок прежний — по ``created_at``.
         """
-        return (self.priority.rank, self.created_at, self.sequence)
+        return (
+            self.priority.rank,
+            self.priority_at or self.created_at,
+            self.created_at,
+            self.sequence,
+        )
 
 
 class ResourceResult(DomainModel):

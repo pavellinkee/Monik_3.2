@@ -35,6 +35,7 @@ from monik.services.level2 import (
     RouteVerifier,
 )
 from monik.services.observability import FakeClock
+from monik.services.observability.metrics import MetricsRegistry
 from monik.services.registries import CapabilityRegistry, NetworkRegistry, TokenRegistry
 from tests import factories as f
 from tests.component.level1.conftest import (
@@ -98,10 +99,15 @@ async def build_level2(
     fees: StaticFeeSource | None = None,
     gas: StaticGasSource | None = None,
     rates: StaticRateSource | None = None,
+    metrics: MetricsRegistry | None = None,
 ) -> Level2Harness:
     """Создать Opportunity через Level 1 и собрать над ней Level 2."""
     level1 = build_harness(
-        configuration, database, clock, adapters=level1_adapter_set or level1_adapters(clock)
+        configuration,
+        database,
+        clock,
+        adapters=level1_adapter_set or level1_adapters(clock),
+        metrics=metrics,
     )
     scan = await level1.scanner.scan()
     assert scan.opportunities, "фикстуре нужна созданная Level 1 возможность"
@@ -142,6 +148,7 @@ async def build_level2(
         jobs=jobs,
         opportunities=opportunities,
         clock=clock,
+        metrics=metrics,
     )
     return Level2Harness(
         scanner=scanner,

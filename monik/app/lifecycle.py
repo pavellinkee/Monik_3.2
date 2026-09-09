@@ -52,6 +52,7 @@ __all__ = [
     "TASK_CAPABILITY_LOAD",
     "TASK_LEVEL1_SCAN",
     "TASK_NOTIFICATIONS",
+    "TASK_BACKUP",
     "TASK_SYSTEM_HEALTH",
     "TASK_TELEGRAM_COMMANDS",
     "Application",
@@ -67,6 +68,10 @@ TASK_NOTIFICATIONS = "notification_delivery"
 TASK_TELEGRAM_COMMANDS = "telegram_commands"
 TASK_CAPABILITY_LOAD = "capability_load"
 TASK_SYSTEM_HEALTH = "system_health_notifications"
+TASK_BACKUP = "backup"
+
+#: День недели резервного копирования по умолчанию (ISO: суббота).
+_SATURDAY = 6
 
 #: Расписания по умолчанию. Пользовательская конфигурация имеет приоритет
 #: (``14_SCHEDULER.md`` §58-59).
@@ -76,6 +81,12 @@ _DEFAULT_SCHEDULES: dict[str, TaskScheduleConfig] = {
     TASK_TELEGRAM_COMMANDS: TaskScheduleConfig(mode=TaskMode.INTERVAL, interval_seconds=5),
     TASK_CAPABILITY_LOAD: TaskScheduleConfig(mode=TaskMode.STARTUP),
     TASK_SYSTEM_HEALTH: TaskScheduleConfig(mode=TaskMode.INTERVAL, interval_seconds=60),
+    # Резервная копия по умолчанию: суббота, 03:00. Ночь выходного дня —
+    # время наименьшей нагрузки; конкретный день и час задаются
+    # конфигурацией планировщика.
+    TASK_BACKUP: TaskScheduleConfig(
+        mode=TaskMode.WEEKLY, time="03:00", weekday=_SATURDAY, timezone="UTC"
+    ),
 }
 
 
@@ -191,6 +202,12 @@ class Application:
         """
         interval = 1.0
         while not self._stop.is_set():
+            if self.container.control.restart_requested:
+                # Перезапуск выполняет менеджер служб: приложение только
+                # корректно завершает текущую работу и выходит.
+                _LOGGER.warning("restart requested; stopping the application")
+                self.request_stop()
+                break
             await self.scheduler.tick()
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=interval)
@@ -237,6 +254,13 @@ def build_application(
         _notification_task(container),
         config=config.scheduler,
         default=_DEFAULT_SCHEDULES[TASK_NOTIFICATIONS],
+    )
+    registry.register(
+        TASK_BACKUP,
+        _backup_task(container),
+        config=config.scheduler,
+        default=_DEFAULT_SCHEDULES[TASK_BACKUP],
+        priority=RequestPriority.MAINTENANCE,
     )
     if container.system_notifier is not None:
         registry.register(
@@ -324,6 +348,14 @@ def _level1_task(container: Container) -> TaskHandler:
     """
 
     async def run() -> None:
+        if not container.control.is_running:
+            # Оператор остановил сканирование: новые циклы не начинаются,
+            # но уже принятые проверки Level 2 доводятся до конца.
+            _LOGGER.info(
+                "level 1 scan skipped",
+                extra=log_fields(state=container.control.state().value),
+            )
+            return
         await container.level1.scan()
         container.health.set_component(
             "level1",
@@ -337,6 +369,20 @@ def _level1_task(container: Container) -> TaskHandler:
 def _notification_task(container: Container) -> TaskHandler:
     async def run() -> None:
         await container.notifications.dispatch_pending()
+
+    return run
+
+
+def _backup_task(container: Container) -> TaskHandler:
+    """Резервное копирование базы.
+
+    Сбой копирования не останавливает сканер: обслуживающая задача имеет
+    самый низкий приоритет и не блокирует работу (``05`` §20).
+    """
+
+    async def run() -> None:
+        if container.backups is not None:
+            await container.backups.run()
 
     return run
 

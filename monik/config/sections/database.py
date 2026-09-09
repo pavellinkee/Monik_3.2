@@ -39,6 +39,9 @@ class DatabaseConfig(ConfigSection):
     integrity_check_on_startup: bool = True
     backup_enabled: bool = False
     backup_directory: str | None = Field(default=None, max_length=512)
+    #: Сколько копий хранить. Старые удаляются, иначе диск заполняется
+    #: бесконечно (``31_DATA_RETENTION.md``).
+    backup_retention_copies: int = Field(default=8, ge=1, le=365)
     cleanup_enabled: bool = True
     retention: RetentionConfig = RetentionConfig()
 

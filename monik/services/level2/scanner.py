@@ -97,7 +97,7 @@ class Level2Scanner:
 
         try:
             async with asyncio.timeout(self._config.confirmation_timeout_seconds):
-                results = await self._verify_amounts(opportunity)
+                results = await self._verify_amounts(opportunity, started_at=started_at)
         except TimeoutError:
             # Таймаут Job (§27) не является признаком убыточности.
             return await self._fail_all_amounts(
@@ -122,17 +122,21 @@ class Level2Scanner:
         return await self._finish(job, opportunity, results, revision, started_at=started_at)
 
     async def _verify_amounts(
-        self, opportunity: Opportunity
+        self, opportunity: Opportunity, *, started_at: UtcDatetime
     ) -> tuple[AmountVerificationResult, ...]:
         """Проверить все суммы возможности.
 
         Произвольно выбирать только самую прибыльную сумму запрещено (§9).
         Суммы проверяются последовательно: каждая требует собственной пары
         BUY/SELL запросов, а порядок делает результат детерминированным.
+
+        ``started_at`` — момент начала этой проверки Level 2. Он передаётся
+        каждому запросу, поэтому проверка, начатая раньше, обслуживается
+        раньше начатой позже (``05_RESOURCE_MANAGER.md`` §17-18).
         """
         results = []
         for amount in opportunity.amounts:
-            results.append(await self._verifier.verify(opportunity, amount))
+            results.append(await self._verifier.verify(opportunity, amount, priority_at=started_at))
         return tuple(results)
 
     async def _finish(
@@ -217,6 +221,9 @@ class Level2Scanner:
         self._metrics.increment(names.LEVEL2_JOBS, status=result.job_status.value)
         for amount in result.amount_results:
             self._metrics.increment(names.LEVEL2_AMOUNTS, status=amount.status.value)
+            self._metrics.increment(
+                names.LEVEL2_CONFIRMATIONS, status=amount.confirmation_status.value
+            )
         self._metrics.observe(
             names.LEVEL2_SECONDS,
             (completed_at - started_at).total_seconds(),
